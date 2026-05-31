@@ -12,7 +12,7 @@
 | TASK-06 | SAI callbacks and deinterleave | DONE | Verified on hardware via `scripts/check_task06_deinterleave.ps1` (deinterleave loop runs, `overruns=0`) and `scripts/check_usb_cdc_stream.ps1` (OTG CDC `RAW1` frames: header/seq/range valid). |
 | TASK-07 | Hann window and FFT | DONE | Verified on hardware via `scripts/check_task07_fft.ps1`: CMSIS-DSP 1024-pt rfft on all 8 mics; self-test 1 kHz -> peak bin 64; ~9.2 ms/8-mic pass; overruns=0. |
 | TASK-08 | GCC-PHAT and TDOA | DONE | Verified on hardware via `scripts/check_task08_gccphat.ps1`: GCC-PHAT self-test (synthetic 5-sample delay -> lag 5); live mic0-vs-mic1..7 lags computed each heartbeat; overruns=0. |
-| TASK-09 | RTOS tasks and IPC | TODO | Create FFT, USB, DOA, and monitor tasks. |
+| TASK-09 | RTOS tasks and IPC | IN PROGRESS | FreeRTOS being enabled via CubeMX (manual config steps recorded below). Not generated/verified yet. |
 | TASK-10 | USB CDC transmit | TODO | Stream data to the PC over USB CDC. |
 | TASK-11 | DOA output | TODO | Convert TDOA results into direction output. |
 | TASK-12 | Monitor and watchdog | TODO | Add runtime health checks and watchdog handling. |
@@ -741,3 +741,86 @@ TASK-08 GCC-PHAT check passed.
   per-bin cross-spectrum/`sqrtf` loop is in `main.c` at `-O0`; still `overruns=0` because one heavy
   heartbeat iteration (~51 ms incl. FFT) stays under the 64 ms half-buffer period. TASK-09 will move
   this into a dedicated RTOS task and can cache mic0's spectrum / compute all 28 pairs off the hot path.
+
+---
+
+## TASK-09 - RTOS Tasks & IPC
+
+**Status:** IN PROGRESS - FreeRTOS is being enabled **via CubeMX by hand** (the `.ioc` shipped without
+it). Not generated/verified yet. The manual configuration steps are recorded here so the setup is
+reproducible and the project-specific gotchas are not lost.
+
+**Goal:** Run the pipeline under FreeRTOS - FFT, USB, DOA, Monitor tasks + a result queue + task
+notifications from the SAI callback. "Done when" = `vTaskList()` shows all 4 tasks Ready/Blocked.
+
+### A. Before opening CubeMX
+
+1. Commit/back up the working TASK-01..08 state (done: pushed to `develop`).
+2. CubeMX **regenerates** `STM32CubeIDE/Debug/{makefile,objects.list,Drivers/CMSIS/DSP/subdir.mk}`, so
+   the TASK-07 CMSIS-DSP build wiring is **lost on regen** - re-apply it afterwards (step C2). Those
+   files are gitignored (`STM32CubeIDE/Debug/`), so they are not in the repo either.
+
+### B. CubeMX steps
+
+1. **Enable FreeRTOS:** *Middleware and Software Packs -> FREERTOS*, Interface = **CMSIS_V2**.
+2. **Change HAL timebase (MANDATORY):** *System Core -> SYS -> Timebase Source* = **TIM6** (or TIM7).
+   FreeRTOS takes over SysTick; leaving HAL on SysTick makes `HAL_Delay`/timeouts hang. CubeMX then
+   routes `HAL_IncTick()` to the TIM6 IRQ and wires SVC/PendSV/SysTick to the FreeRTOS port.
+3. **Fix NVIC priorities (MANDATORY - this project's #1 crash trap):** today DMA1_Stream0-3, SAI1,
+   EXTI15_10, OTG_HS are all at **preempt priority 0**. Any ISR that calls a `...FromISR()` API (the
+   SAI callback will call `xTaskNotifyFromISR`) must have preempt priority **numerically >=
+   `configMAX_SYSCALL_INTERRUPT_PRIORITY` (default 5)**. In *NVIC Settings* set preempt priority = **5**
+   for `DMA1_Stream0..3`, `SAI1` (and `SAI2` when enabled in TASK-12) and `EXTI15_10`; set `OTG_HS` to
+   **6**. Keep the NVIC group at 4 bits.
+4. **FreeRTOS config parameters:** `TICK_RATE_HZ` = 1000; `TOTAL_HEAP_SIZE` ~= **32768** (heap_4, lands
+   in AXI SRAM); leave `configMAX_SYSCALL_INTERRUPT_PRIORITY` = 5 (matches step 3); enable
+   `USE_TRACE_FACILITY` and `USE_STATS_FORMATTING_FUNCTIONS` (needed for `vTaskList`) and
+   `INCLUDE_uxTaskGetStackHighWaterMark` (for TASK-12).
+5. **Tasks & queue** (per the breakdown):
+
+   | Task | Priority (CMSIS_V2) | Stack (words) |
+   |------|---------------------|---------------|
+   | FFT_Task | osPriorityHigh | 2048 |
+   | USB_Task | osPriorityRealtime | 512 |
+   | DOA_Task | osPriorityAboveNormal | 512 |
+   | Monitor_Task | osPriorityLow | 256 |
+
+   Queue `result_queue`, depth 4, item size `sizeof(tdoa_result)`. (Alternatively create only
+   `defaultTask` in CubeMX and `xTaskCreate` the rest in USER CODE to stay close to the breakdown's
+   native-FreeRTOS notification flags `FLAG_FFT | FLAG_USB`.)
+6. **Generate Code.**
+
+### C. After regeneration
+
+1. **Memory:** FreeRTOS heap (~32 KB) is in AXI SRAM; the DTCM working set (`mic_data`, `mic_raw`, FFT
+   and GCC buffers ~108 KB) still fits the 128 KB DTCM.
+2. **Re-apply the CMSIS-DSP build wiring** (lost on regen): recreate
+   `STM32CubeIDE/Debug/Drivers/CMSIS/DSP/subdir.mk`, add `-include Drivers/CMSIS/DSP/subdir.mk` to
+   `makefile`, and add the five DSP `.o` to `objects.list` (see the TASK-07 section above and memory
+   `cmsis-dsp-build-integration`). Better long-term: add CMSIS-DSP through CubeMX/`.cproject` so it is
+   tracked and survives regen.
+3. **Move the superloop into tasks:**
+   - `FFT_Task`: `xTaskNotifyWait(FLAG_FFT)` -> deinterleave (move it out of the ISR) -> `FFT_ProcessAll()`
+     -> `GCC_ProcessPairs()` -> `xQueueSend(result_queue, ...)`.
+   - `USB_Task`: `xTaskNotifyWait(FLAG_USB)` -> build the RAW1 frame -> `CDC_Transmit_HS`.
+   - SAI master-block callback (`HAL_SAI_RxHalfCpltCallback`/`RxCpltCallback`): replace `g_half_ready=1`
+     with `xTaskNotifyFromISR(fft_task, FLAG_FFT|FLAG_USB, eSetBits, &woken)` + `portYIELD_FROM_ISR(woken)`.
+   - Start `Audio_Start()` before `osKernelStart()`; remove the old `while(1)` loop.
+4. **Keep the self-tests:** call `FFT_SelfTest()` / `GCC_SelfTest()` once (e.g. at the top of `FFT_Task`
+   before its `for(;;)`) so TASK-07/08 stay verifiable.
+
+### D. Verify ("Done when")
+
+Print `vTaskList()` from Monitor_Task (or defaultTask) over the VCP:
+
+```c
+char buf[400];
+vTaskList(buf);
+printf("Task          State Prio Stack Num\r\n%s\r\n", buf);
+```
+
+Pass when all 4 tasks appear in Ready/Blocked (`R`/`B`) state.
+
+> **Top gotcha:** step B3 (lower the DMA/SAI IRQ preempt priority to >= 5). A priority-0 ISR calling a
+> FreeRTOS `...FromISR()` API trips `configASSERT` / HardFaults - the most common failure when adding
+> FreeRTOS to existing priority-0 DMA code.
