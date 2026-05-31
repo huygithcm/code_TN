@@ -1,25 +1,19 @@
 USB CDC raw stream check
-Generated: 2026-06-01 00:23:26
+Generated: 2026-06-01 01:04:01
 
 TASK-06 USB CDC Raw Stream Check
-Using OTG CDC port: COM12
+Auto-detected OTG CDC port: COM12
 Expecting frames: magic=RAW1 nch=8 nsamp=1024 fmt=0 (32780 bytes each)
-Need 10 valid frame(s) within 20 s.
+Need 4 valid frame(s) within 20 s.
 
-Captured 459432 bytes from COM12
+Captured 262240 bytes from COM12
 
-frame 1: seq=487  ch0[0..32767] ch1[0..32767] ch2[0..32767] ch3[0..32767] ch4[0..32767] ch5[0..32767] ch6[0..32767] ch7[0..32767]
-frame 2: seq=488  ch0[0..32767] ch1[0..32767] ch2[0..32767] ch3[0..32767] ch4[0..32767] ch5[0..32767] ch6[0..32767] ch7[0..32767]
-frame 3: seq=489  ch0[0..32767] ch1[0..32767] ch2[0..32767] ch3[0..32767] ch4[0..32767] ch5[0..32767] ch6[0..32767] ch7[0..32767]
-frame 4: seq=490  ch0[0..32767] ch1[0..32767] ch2[0..32767] ch3[0..32767] ch4[0..32767] ch5[0..32767] ch6[0..32767] ch7[0..32767]
-frame 5: seq=491  ch0[0..32767] ch1[0..32767] ch2[0..32767] ch3[0..32767] ch4[0..32767] ch5[0..32767] ch6[0..32767] ch7[0..32767]
-frame 6: seq=492  ch0[0..32767] ch1[0..32767] ch2[0..32767] ch3[0..32767] ch4[0..32767] ch5[0..32767] ch6[0..32767] ch7[0..32767]
-frame 7: seq=493  ch0[0..32767] ch1[0..32767] ch2[0..32767] ch3[0..32767] ch4[0..32767] ch5[0..32767] ch6[0..32767] ch7[0..32767]
-frame 8: seq=494  ch0[0..32767] ch1[0..32767] ch2[0..32767] ch3[0..32767] ch4[0..32767] ch5[0..32767] ch6[0..32767] ch7[0..32767]
-frame 9: seq=495  ch0[0..32767] ch1[0..32767] ch2[0..32767] ch3[0..32767] ch4[0..32767] ch5[0..32767] ch6[0..32767] ch7[0..32767]
-frame 10: seq=496  ch0[0..32767] ch1[0..32767] ch2[0..32767] ch3[0..32767] ch4[0..32767] ch5[0..32767] ch6[0..32767] ch7[0..32767]
+frame 1: seq=94  ch0[-8375..7389] ch1[-7935..7881] ch2[-9755..9865] ch3[-8183..9345] ch4[-6906..7513] ch5[-7630..6522] ch6[-6773..7780] ch7[-8271..8941]
+frame 2: seq=95  ch0[-7894..5190] ch1[-6361..6394] ch2[-8239..8420] ch3[-5487..7846] ch4[-6854..6777] ch5[-4055..5520] ch6[-7256..5502] ch7[-5843..9847]
+frame 3: seq=96  ch0[-6241..7577] ch1[-6588..5657] ch2[-7078..7999] ch3[-8265..9039] ch4[-8323..5328] ch5[-10159..4779] ch6[-7445..7367] ch7[-7794..7027]
+frame 4: seq=97  ch0[-13604..6838] ch1[-5921..6456] ch2[-7154..6500] ch3[-7078..5161] ch4[-6249..6004] ch5[-4977..9893] ch6[-6754..7820] ch7[-7770..7203]
 
-[ OK ] Received 10 valid RAW1 frame(s)
+[ OK ] Received 4 valid RAW1 frame(s)
 [ OK ] Headers valid (nch=8 nsamp=1024 fmt=0)
 [ OK ] Sequence counter advanced
 [ OK ] All samples within 24-bit range

@@ -27,8 +27,10 @@
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include "usbd_cdc_if.h"
 #include "usbd_cdc.h"
+#include "arm_math.h"        /* TASK-07: CMSIS-DSP (rfft, windowing, magnitude) */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -54,6 +56,19 @@
 #define RAW_HDR_BYTES        12U                         /* magic(4)+seq(4)+nch(1)+nsamp(2)+fmt(1)    */
 #define RAW_PAYLOAD_BYTES    (RAW_NCH * RAW_NSAMP * 4U)  /* int32 channel-major                       */
 #define USB_FRAME_LEN        (RAW_HDR_BYTES + RAW_PAYLOAD_BYTES)
+
+/* TASK-07: Hann window + 1024-point real FFT (CMSIS-DSP) for all 8 mics. */
+#define FFT_ENABLE           1
+#define FFT_SIZE             AUDIO_BLOCK_SAMPLES          /* 1024-point FFT             */
+#define FFT_BINS             (FFT_SIZE / 2U)              /* 512 magnitude bins         */
+#define AUDIO_FS_HZ          16000U                       /* sample rate (see CLAUDE.md)*/
+#define FFT_SELFTEST_HZ      1000.0f                      /* self-test tone -> bin 64   */
+#define PI_F                 3.14159265358979f
+
+/* TASK-08: GCC-PHAT time-delay estimation between mic pairs. */
+#define GCC_ENABLE           1
+#define GCC_SELFTEST_SHIFT   5                            /* synthetic delay -> lag 5   */
+#define GCC_NPAIRS_LIVE      (NUM_MIC_CHANNELS - 1U)      /* live demo: mic0 vs mic1..7 */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -106,6 +121,40 @@ uint32_t g_usb_seq;                 /* raw frames successfully queued to USB    
 uint8_t  usb_tx_frame[USB_FRAME_LEN];
 extern USBD_HandleTypeDef hUsbDeviceHS;
 #endif
+
+#if FFT_ENABLE
+/* TASK-07 FFT working set, all in DTCM for fast CPU/FPU access.
+ * hann_window : pre-computed once. fft_win : windowed input (overwritten per mic).
+ * fft_cplx    : rfft_fast output (packed real spectrum, 1024 floats).
+ * fft_mag     : per-mic magnitude spectrum (512 bins). */
+__attribute__((section(".DTCMSection"), aligned(32), used))
+float   hann_window[FFT_SIZE];
+__attribute__((section(".DTCMSection"), aligned(32), used))
+float   fft_win[FFT_SIZE];
+__attribute__((section(".DTCMSection"), aligned(32), used))
+float   fft_cplx[FFT_SIZE];
+__attribute__((section(".DTCMSection"), aligned(32), used))
+float   fft_mag[NUM_MIC_CHANNELS][FFT_BINS];
+
+static arm_rfft_fast_instance_f32 fft_inst;
+volatile uint32_t g_fft_us;        /* last 8-mic FFT compute time (microseconds) */
+
+#if GCC_ENABLE
+/* TASK-08 GCC-PHAT scratch (DTCM). gcc_a/gcc_b: packed spectra of the two inputs;
+ * gcc_r: PHAT-weighted cross-spectrum; gcc_corr: time-domain cross-correlation. */
+__attribute__((section(".DTCMSection"), aligned(32), used))
+float   gcc_a[FFT_SIZE];
+__attribute__((section(".DTCMSection"), aligned(32), used))
+float   gcc_b[FFT_SIZE];
+__attribute__((section(".DTCMSection"), aligned(32), used))
+float   gcc_r[FFT_SIZE];
+__attribute__((section(".DTCMSection"), aligned(32), used))
+float   gcc_corr[FFT_SIZE];
+
+volatile int32_t  g_tdoa_lag[GCC_NPAIRS_LIVE];  /* mic0 vs mic(k+1), samples */
+volatile uint32_t g_gcc_us;                     /* time to compute the live pairs (us) */
+#endif
+#endif
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -121,6 +170,17 @@ void Clock_Verify(void);
 void SAI_Verify(void);
 void Audio_Start(void);
 static void Deinterleave_Pair(uint32_t off, uint8_t pair);
+#if FFT_ENABLE
+void FFT_Init(void);
+void FFT_ProcessAll(void);
+void FFT_SelfTest(void);
+static uint32_t FFT_PeakBin(const float *mag, float *peakVal);
+#if GCC_ENABLE
+int32_t GCC_PHAT(const float *a, const float *b);
+void GCC_SelfTest(void);
+void GCC_ProcessPairs(void);
+#endif
+#endif
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -233,6 +293,16 @@ int main(void)
          USB_RAW_STREAM ? " + raw USB CDC stream" : "");
   uint32_t blocks = 0U;
 
+#if FFT_ENABLE
+  /* TASK-07: build the Hann window + FFT instance, then self-test the pipeline. */
+  FFT_Init();
+  FFT_SelfTest();
+#if GCC_ENABLE
+  /* TASK-08: verify GCC-PHAT time-delay estimation on a synthetic delay. */
+  GCC_SelfTest();
+#endif
+#endif
+
   while (1)
   {
     if (g_half_ready)
@@ -258,6 +328,31 @@ int main(void)
         printf("blk=%lu mic0[min=%ld max=%ld] usb_seq=%lu overruns=%lu\r\n",
                (unsigned long)blocks, (long)mn, (long)mx,
                (unsigned long)g_usb_seq, (unsigned long)g_overruns);
+
+#if FFT_ENABLE
+        /* TASK-07: run the 8-mic FFT on this freshly deinterleaved block and
+         * report each mic's dominant bin (-> frequency) plus the compute time.
+         * (Throttled to the ~1 Hz heartbeat here; TASK-09 moves it to its own
+         * RTOS task running every block.) */
+        FFT_ProcessAll();
+        printf("FFT %luus peakHz[", (unsigned long)g_fft_us);
+        for (uint32_t m = 0U; m < NUM_MIC_CHANNELS; m++)
+        {
+          float    pk;
+          uint32_t bin = FFT_PeakBin(fft_mag[m], &pk);
+          uint32_t hz  = (bin * AUDIO_FS_HZ) / FFT_SIZE;
+          printf("%lu%s", (unsigned long)hz, (m < NUM_MIC_CHANNELS - 1U) ? " " : "]\r\n");
+        }
+#if GCC_ENABLE
+        /* TASK-08: live TDOA lags, mic0 vs mic1..7 (samples). */
+        GCC_ProcessPairs();
+        printf("GCC %luus lag0x[", (unsigned long)g_gcc_us);
+        for (uint32_t k = 0U; k < GCC_NPAIRS_LIVE; k++)
+        {
+          printf("%ld%s", (long)g_tdoa_lag[k], (k < GCC_NPAIRS_LIVE - 1U) ? " " : "]\r\n");
+        }
+#endif
+#endif
       }
 
 #if USB_RAW_STREAM
@@ -400,7 +495,7 @@ static void MX_SAI1_Init(void)
   hsai_BlockA1.Init.AudioMode = SAI_MODEMASTER_RX;
   hsai_BlockA1.Init.DataSize = SAI_DATASIZE_24;
   hsai_BlockA1.Init.FirstBit = SAI_FIRSTBIT_MSB;
-  hsai_BlockA1.Init.ClockStrobing = SAI_CLOCKSTROBING_FALLINGEDGE;
+  hsai_BlockA1.Init.ClockStrobing = SAI_CLOCKSTROBING_RISINGEDGE;
   hsai_BlockA1.Init.Synchro = SAI_ASYNCHRONOUS;
   hsai_BlockA1.Init.OutputDrive = SAI_OUTPUTDRIVE_DISABLE;
   hsai_BlockA1.Init.NoDivider = SAI_MASTERDIVIDER_ENABLE;
@@ -419,7 +514,7 @@ static void MX_SAI1_Init(void)
   hsai_BlockA1.FrameInit.ActiveFrameLength = 32;
   hsai_BlockA1.FrameInit.FSDefinition = SAI_FS_CHANNEL_IDENTIFICATION;
   hsai_BlockA1.FrameInit.FSPolarity = SAI_FS_ACTIVE_LOW;
-  hsai_BlockA1.FrameInit.FSOffset = SAI_FS_BEFOREFIRSTBIT;
+  hsai_BlockA1.FrameInit.FSOffset = SAI_FS_FIRSTBIT;
   hsai_BlockA1.SlotInit.FirstBitOffset = 0;
   hsai_BlockA1.SlotInit.SlotSize = SAI_SLOTSIZE_32B;
   hsai_BlockA1.SlotInit.SlotNumber = 2;
@@ -433,7 +528,7 @@ static void MX_SAI1_Init(void)
   hsai_BlockB1.Init.AudioMode = SAI_MODESLAVE_RX;
   hsai_BlockB1.Init.DataSize = SAI_DATASIZE_24;
   hsai_BlockB1.Init.FirstBit = SAI_FIRSTBIT_MSB;
-  hsai_BlockB1.Init.ClockStrobing = SAI_CLOCKSTROBING_FALLINGEDGE;
+  hsai_BlockB1.Init.ClockStrobing = SAI_CLOCKSTROBING_RISINGEDGE;
   hsai_BlockB1.Init.Synchro = SAI_SYNCHRONOUS;
   hsai_BlockB1.Init.OutputDrive = SAI_OUTPUTDRIVE_DISABLE;
   hsai_BlockB1.Init.FIFOThreshold = SAI_FIFOTHRESHOLD_EMPTY;
@@ -448,7 +543,7 @@ static void MX_SAI1_Init(void)
   hsai_BlockB1.FrameInit.ActiveFrameLength = 32;
   hsai_BlockB1.FrameInit.FSDefinition = SAI_FS_CHANNEL_IDENTIFICATION;
   hsai_BlockB1.FrameInit.FSPolarity = SAI_FS_ACTIVE_LOW;
-  hsai_BlockB1.FrameInit.FSOffset = SAI_FS_BEFOREFIRSTBIT;
+  hsai_BlockB1.FrameInit.FSOffset = SAI_FS_FIRSTBIT;
   hsai_BlockB1.SlotInit.FirstBitOffset = 0;
   hsai_BlockB1.SlotInit.SlotSize = SAI_SLOTSIZE_32B;
   hsai_BlockB1.SlotInit.SlotNumber = 2;
@@ -483,7 +578,7 @@ static void MX_SAI2_Init(void)
   hsai_BlockA2.Init.AudioMode = SAI_MODESLAVE_RX;
   hsai_BlockA2.Init.DataSize = SAI_DATASIZE_24;
   hsai_BlockA2.Init.FirstBit = SAI_FIRSTBIT_MSB;
-  hsai_BlockA2.Init.ClockStrobing = SAI_CLOCKSTROBING_FALLINGEDGE;
+  hsai_BlockA2.Init.ClockStrobing = SAI_CLOCKSTROBING_RISINGEDGE;
   hsai_BlockA2.Init.Synchro = SAI_SYNCHRONOUS_EXT_SAI1;
   hsai_BlockA2.Init.OutputDrive = SAI_OUTPUTDRIVE_DISABLE;
   hsai_BlockA2.Init.FIFOThreshold = SAI_FIFOTHRESHOLD_EMPTY;
@@ -497,7 +592,7 @@ static void MX_SAI2_Init(void)
   hsai_BlockA2.FrameInit.ActiveFrameLength = 32;
   hsai_BlockA2.FrameInit.FSDefinition = SAI_FS_CHANNEL_IDENTIFICATION;
   hsai_BlockA2.FrameInit.FSPolarity = SAI_FS_ACTIVE_LOW;
-  hsai_BlockA2.FrameInit.FSOffset = SAI_FS_BEFOREFIRSTBIT;
+  hsai_BlockA2.FrameInit.FSOffset = SAI_FS_FIRSTBIT;
   hsai_BlockA2.SlotInit.FirstBitOffset = 0;
   hsai_BlockA2.SlotInit.SlotSize = SAI_SLOTSIZE_32B;
   hsai_BlockA2.SlotInit.SlotNumber = 2;
@@ -511,7 +606,7 @@ static void MX_SAI2_Init(void)
   hsai_BlockB2.Init.AudioMode = SAI_MODESLAVE_RX;
   hsai_BlockB2.Init.DataSize = SAI_DATASIZE_24;
   hsai_BlockB2.Init.FirstBit = SAI_FIRSTBIT_MSB;
-  hsai_BlockB2.Init.ClockStrobing = SAI_CLOCKSTROBING_FALLINGEDGE;
+  hsai_BlockB2.Init.ClockStrobing = SAI_CLOCKSTROBING_RISINGEDGE;
   hsai_BlockB2.Init.Synchro = SAI_SYNCHRONOUS_EXT_SAI1;
   hsai_BlockB2.Init.OutputDrive = SAI_OUTPUTDRIVE_DISABLE;
   hsai_BlockB2.Init.FIFOThreshold = SAI_FIFOTHRESHOLD_EMPTY;
@@ -525,7 +620,7 @@ static void MX_SAI2_Init(void)
   hsai_BlockB2.FrameInit.ActiveFrameLength = 32;
   hsai_BlockB2.FrameInit.FSDefinition = SAI_FS_CHANNEL_IDENTIFICATION;
   hsai_BlockB2.FrameInit.FSPolarity = SAI_FS_ACTIVE_LOW;
-  hsai_BlockB2.FrameInit.FSOffset = SAI_FS_BEFOREFIRSTBIT;
+  hsai_BlockB2.FrameInit.FSOffset = SAI_FS_FIRSTBIT;
   hsai_BlockB2.SlotInit.FirstBitOffset = 0;
   hsai_BlockB2.SlotInit.SlotSize = SAI_SLOTSIZE_32B;
   hsai_BlockB2.SlotInit.SlotNumber = 2;
@@ -745,8 +840,8 @@ static void Deinterleave_Pair(uint32_t off, uint8_t pair)
   uint8_t r = (uint8_t)(pair * 2U + 1U);
   for (uint32_t i = 0U; i < AUDIO_BLOCK_SAMPLES; i++)
   {
-    int32_t rl = src[2U * i]      >> 8;
-    int32_t rr = src[2U * i + 1U] >> 8;
+    int32_t rl = (int16_t)(src[2U * i] & 0xFFFF);
+    int32_t rr = (int16_t)(src[2U * i + 1U] & 0xFFFF);
     mic_raw[l][i]  = rl;
     mic_raw[r][i]  = rr;
     mic_data[l][i] = (float)rl * (1.0f / 8388608.0f);
@@ -774,6 +869,188 @@ void Audio_Start(void)
   if (HAL_SAI_Receive_DMA(&hsai_BlockB1, (uint8_t *)dma_buf[1], DMA_FULL_WORDS) != HAL_OK) { Error_Handler(); }
   if (HAL_SAI_Receive_DMA(&hsai_BlockA1, (uint8_t *)dma_buf[0], DMA_FULL_WORDS) != HAL_OK) { Error_Handler(); }
 }
+
+#if FFT_ENABLE
+/**
+  * @brief  TASK-07 - initialise the real-FFT instance and pre-compute the Hann
+  *         window once. Called before the capture loop starts using the FFT.
+  */
+void FFT_Init(void)
+{
+  arm_rfft_fast_init_f32(&fft_inst, FFT_SIZE);
+  for (uint32_t i = 0U; i < FFT_SIZE; i++)
+  {
+    hann_window[i] = 0.5f * (1.0f - cosf((2.0f * PI_F * (float)i) / (float)(FFT_SIZE - 1U)));
+  }
+}
+
+/* Find the dominant magnitude bin, skipping DC (bin 0). Returns the bin index
+ * and writes its magnitude to *peakVal. */
+static uint32_t FFT_PeakBin(const float *mag, float *peakVal)
+{
+  float    best = mag[1];
+  uint32_t bin  = 1U;
+  for (uint32_t k = 2U; k < FFT_BINS; k++)
+  {
+    if (mag[k] > best) { best = mag[k]; bin = k; }
+  }
+  *peakVal = best;
+  return bin;
+}
+
+/**
+  * @brief  TASK-07 - window + 1024-pt real FFT + magnitude for all 8 mics.
+  *         Reads mic_data[m][] (float, normalized), writes fft_mag[m][0..511].
+  *         Times the whole 8-mic pass with the DWT cycle counter.
+  */
+void FFT_ProcessAll(void)
+{
+  uint32_t t0 = DWT->CYCCNT;
+  for (uint32_t m = 0U; m < NUM_MIC_CHANNELS; m++)
+  {
+    arm_mult_f32(mic_data[m], hann_window, fft_win, FFT_SIZE);
+    arm_rfft_fast_f32(&fft_inst, fft_win, fft_cplx, 0U);   /* forward */
+    /* rfft_fast packs DC in [0] and Nyquist in [1]; mag[0] is sqrt(DC^2+Nyq^2),
+     * which we ignore for peak detection anyway. */
+    arm_cmplx_mag_f32(fft_cplx, fft_mag[m], FFT_BINS);
+  }
+  g_fft_us = (DWT->CYCCNT - t0) / (AUDIO_FS_HZ == 16000U ? 64U : 64U); /* cycles@64MHz -> us */
+}
+
+/**
+  * @brief  TASK-07 - self-test independent of the mics: synthesize a clean
+  *         1 kHz sine, run it through the FFT pipeline, and confirm the peak
+  *         lands on the expected bin (1000/16000*1024 = 64). Proves the window,
+  *         rfft and magnitude path are correct before trusting live mic input.
+  */
+void FFT_SelfTest(void)
+{
+  for (uint32_t i = 0U; i < FFT_SIZE; i++)
+  {
+    fft_win[i] = sinf((2.0f * PI_F * FFT_SELFTEST_HZ * (float)i) / (float)AUDIO_FS_HZ);
+  }
+  arm_mult_f32(fft_win, hann_window, fft_win, FFT_SIZE);
+  arm_rfft_fast_f32(&fft_inst, fft_win, fft_cplx, 0U);
+  arm_cmplx_mag_f32(fft_cplx, fft_mag[0], FFT_BINS);
+
+  float    pk;
+  uint32_t bin = FFT_PeakBin(fft_mag[0], &pk);
+  uint32_t expBin = (uint32_t)((FFT_SELFTEST_HZ * (float)FFT_SIZE) / (float)AUDIO_FS_HZ + 0.5f);
+
+  printf("\r\n--- TASK-07 Hann + FFT ---\r\n");
+  printf("self-test: %d Hz -> peak bin %lu (expected %lu) mag=%ld\r\n",
+         (int)FFT_SELFTEST_HZ, (unsigned long)bin, (unsigned long)expBin, (long)pk);
+  if ((bin + 1U >= expBin) && (bin <= expBin + 1U))
+  {
+    printf("TASK-07 self-test OK (peak within +/-1 bin).\r\n");
+  }
+  else
+  {
+    printf("TASK-07 self-test FAIL (peak bin off).\r\n");
+    BSP_LED_On(LED_RED);
+  }
+}
+
+#if GCC_ENABLE
+/**
+  * @brief  TASK-08 - GCC-PHAT time-delay estimate between two real signals.
+  *         Returns the lag in samples; positive lag means signal b is a delayed
+  *         copy of a (a arrives first). Valid range +/- FFT_SIZE/2.
+  *
+  *  r[n] = IFFT( Xa . conj(Xb) / |Xa . conj(Xb)| )  -> peak index is the delay.
+  *  PHAT whitening (divide by magnitude) sharpens the peak and makes it robust to
+  *  the source spectrum. Note arm_rfft_fast_f32 (forward) overwrites its input, so
+  *  we FFT from the fft_win scratch copy, never from the caller's array.
+  */
+int32_t GCC_PHAT(const float *a, const float *b)
+{
+  memcpy(fft_win, a, sizeof(float) * FFT_SIZE);
+  arm_rfft_fast_f32(&fft_inst, fft_win, gcc_a, 0U);
+  memcpy(fft_win, b, sizeof(float) * FFT_SIZE);
+  arm_rfft_fast_f32(&fft_inst, fft_win, gcc_b, 0U);
+
+  /* Packed format: [0] = DC (real), [1] = Nyquist (real), then (re,im) per bin.
+   * For the two real-only terms, conj(Xa).Xb is just the product; PHAT -> sign. */
+  gcc_r[0] = (gcc_a[0] * gcc_b[0] >= 0.0f) ? 1.0f : -1.0f;
+  gcc_r[1] = (gcc_a[1] * gcc_b[1] >= 0.0f) ? 1.0f : -1.0f;
+
+  for (uint32_t k = 1U; k < FFT_BINS; k++)
+  {
+    float ar = gcc_a[2U * k], ai = gcc_a[2U * k + 1U];
+    float br = gcc_b[2U * k], bi = gcc_b[2U * k + 1U];
+    /* conj(Xa) * Xb = (ar - j ai)(br + j bi); peak at +D when b lags a by D
+     * (positive lag => signal reaches mic a before mic b). */
+    float re = ar * br + ai * bi;
+    float im = ar * bi - ai * br;
+    float mag = sqrtf(re * re + im * im);
+    if (mag < 1e-9f) { mag = 1e-9f; }
+    gcc_r[2U * k]      = re / mag;
+    gcc_r[2U * k + 1U] = im / mag;
+  }
+
+  arm_rfft_fast_f32(&fft_inst, gcc_r, gcc_corr, 1U);   /* inverse -> correlation */
+
+  float    maxVal;
+  uint32_t maxIdx;
+  arm_max_f32(gcc_corr, FFT_SIZE, &maxVal, &maxIdx);
+
+  int32_t lag = (int32_t)maxIdx;
+  if (lag > (int32_t)(FFT_SIZE / 2U)) { lag -= (int32_t)FFT_SIZE; }
+  return lag;
+}
+
+/**
+  * @brief  TASK-08 - verify GCC-PHAT independent of the mics: build a broadband
+  *         pseudo-random reference, make a copy circularly delayed by
+  *         GCC_SELFTEST_SHIFT samples, and confirm the estimated lag matches.
+  *         (Broadband, not a pure tone: PHAT whitening needs energy across bins.)
+  */
+void GCC_SelfTest(void)
+{
+  uint32_t lcg = 22695477U;
+  for (uint32_t n = 0U; n < FFT_SIZE; n++)
+  {
+    lcg = lcg * 1103515245U + 12345U;
+    gcc_a[n] = ((float)(lcg >> 9) / (float)0x400000) - 1.0f;   /* ~[-1,1] */
+  }
+  /* gcc_b[n] = gcc_a[n - SHIFT] circularly -> expected lag = +SHIFT */
+  for (uint32_t n = 0U; n < FFT_SIZE; n++)
+  {
+    uint32_t src = (n + FFT_SIZE - (uint32_t)GCC_SELFTEST_SHIFT) % FFT_SIZE;
+    gcc_b[n] = gcc_a[src];
+  }
+  /* GCC_PHAT consumes a (copied to fft_win) before it overwrites gcc_a/gcc_b. */
+  int32_t lag = GCC_PHAT(gcc_a, gcc_b);
+
+  printf("\r\n--- TASK-08 GCC-PHAT / TDOA ---\r\n");
+  printf("self-test: delay %d -> lag %ld (expected %d)\r\n",
+         GCC_SELFTEST_SHIFT, (long)lag, GCC_SELFTEST_SHIFT);
+  if ((lag >= GCC_SELFTEST_SHIFT - 1) && (lag <= GCC_SELFTEST_SHIFT + 1))
+  {
+    printf("TASK-08 self-test OK (lag within +/-1 sample).\r\n");
+  }
+  else
+  {
+    printf("TASK-08 self-test FAIL (lag off).\r\n");
+    BSP_LED_On(LED_RED);
+  }
+}
+
+/**
+  * @brief  TASK-08 - compute live TDOA lags for mic0 vs mic1..7 from mic_data,
+  *         timing the whole set with the DWT counter.
+  */
+void GCC_ProcessPairs(void)
+{
+  uint32_t t0 = DWT->CYCCNT;
+  for (uint32_t k = 0U; k < GCC_NPAIRS_LIVE; k++)
+  {
+    g_tdoa_lag[k] = GCC_PHAT(mic_data[0], mic_data[k + 1U]);
+  }
+  g_gcc_us = (DWT->CYCCNT - t0) / 64U;   /* cycles @ 64 MHz -> us */
+}
+#endif /* GCC_ENABLE */
+#endif /* FFT_ENABLE */
 
 /* USER CODE END 4 */
 

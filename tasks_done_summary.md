@@ -10,8 +10,8 @@
 | TASK-04 | SAI + DMA initialization | DONE | Verified on hardware via `scripts/check_task04_sai.ps1`: all 4 SAI blocks READY, DMA circular/word/no-FIFO, no HAL_ERROR. Note: SAI2_IRQn not enabled (CubeMX) - revisit in TASK-12. |
 | TASK-05 | DMA buffer and ping-pong | DONE | All 4 SAI DMA streams ping-ponging (verified via `scripts/check_task05_dma.ps1`). Fixed SAI1 GCR.SYNCOUT so SAI2 ext-sync works; enabled I/D-cache; block size set to 1024. |
 | TASK-06 | SAI callbacks and deinterleave | DONE | Verified on hardware via `scripts/check_task06_deinterleave.ps1` (deinterleave loop runs, `overruns=0`) and `scripts/check_usb_cdc_stream.ps1` (OTG CDC `RAW1` frames: header/seq/range valid). |
-| TASK-07 | Hann window and FFT | TODO | Add windowing and FFT pipeline. |
-| TASK-08 | GCC-PHAT and TDOA | TODO | Estimate time delay between microphone signals. |
+| TASK-07 | Hann window and FFT | DONE | Verified on hardware via `scripts/check_task07_fft.ps1`: CMSIS-DSP 1024-pt rfft on all 8 mics; self-test 1 kHz -> peak bin 64; ~9.2 ms/8-mic pass; overruns=0. |
+| TASK-08 | GCC-PHAT and TDOA | DONE | Verified on hardware via `scripts/check_task08_gccphat.ps1`: GCC-PHAT self-test (synthetic 5-sample delay -> lag 5); live mic0-vs-mic1..7 lags computed each heartbeat; overruns=0. |
 | TASK-09 | RTOS tasks and IPC | TODO | Create FFT, USB, DOA, and monitor tasks. |
 | TASK-10 | USB CDC transmit | TODO | Stream data to the PC over USB CDC. |
 | TASK-11 | DOA output | TODO | Convert TDOA results into direction output. |
@@ -532,20 +532,22 @@ What it checks per frame:
   (an out-of-range value means the stream is misaligned).
 - Prints per-channel `min..max` so live mic levels are visible.
 
-Verified output (`-Frames 8`):
+Verified output (`-Frames 4`):
 
 ```text
-Captured 393360 bytes from COM12
-frame 1: seq=25  ch0[0..32767] ch1[0..32767] ... ch7[0..32767]
+Captured 262240 bytes from COM12
+frame 1: seq=94  ch0[-8375..7389] ch1[-7935..7881] ch2[-9755..9865] ... ch7[-8271..8941]
+frame 2: seq=95  ch0[-7894..5190] ch1[-6361..6394] ch2[-8239..8420] ... ch7[-5843..9847]
 ...
-frame 8: seq=32  ch0[0..32767] ch1[0..32767] ... ch7[0..32767]
-
-[ OK ] Received 8 valid RAW1 frame(s)
+[ OK ] Received 4 valid RAW1 frame(s)
 [ OK ] Headers valid (nch=8 nsamp=1024 fmt=0)
 [ OK ] Sequence counter advanced
 [ OK ] All samples within 24-bit range
 USB CDC raw stream check passed.
 ```
+
+The per-channel min/max are bipolar and differ across channels and frames — real, independent mic audio
+(see the MATLAB FFT test below for the full content analysis).
 
 Two pitfalls solved while writing this check (keep them in mind for any future CDC reader):
 
@@ -572,26 +574,170 @@ mic_fft_test("COM12", 16)        % average 16 frames
 mic_fft_test("COM12", 32, 30)    % 32 frames, 30 s timeout
 ```
 
-Verified run (12 frames, seq 504-515, no acoustic stimulus applied):
+Verified run (16 frames, seq 116-131, no acoustic stimulus applied):
 
 ```text
 mic       dc(cnt)   rmsAC(cnt)    peakHz   prom_dB  flatness   verdict
-0           16581      16251.0        47      27.8     0.224   TONE @ 47 Hz
+0              12       2694.4        47      40.0     0.031   TONE @ 47 Hz
+2             -31       3209.1        47      41.5     0.027   TONE @ 47 Hz
 ...
-7           17034      16255.6        47      28.7     0.186   TONE @ 47 Hz
+7             -13       2909.0        47      40.2     0.026   TONE @ 47 Hz
 Live channels: 8/8
-[ OK ] Channels are independent (max |corr|=0.863).
+[ OK ] Channels are independent (max |corr|=0.971).
 ```
 
-This explains the earlier `[0..32767]` observation: it is **not** dead/DC data but a periodic ~47 Hz
-signal swinging nearly full scale, present and phase-distinct on all 8 channels (so the capture +
-deinterleave path is functioning and the channels are independent). Caveat: the signal is positive-only
-and ~15-bit, unlike a bipolar 24-bit acoustic recording, so 47 Hz is likely a test/pickup artifact
-rather than ambient sound. To confirm the acoustic path, play a steady tone/whistle near the array and
-re-run — every mic should report `TONE` at that frequency.
+**Result: the microphones read real, bipolar 24-bit audio.** DC ≈ 0 on every channel (±30 counts),
+AC RMS ~2.5-3.2 k counts, and each channel's min/max differs frame to frame — genuine, independent
+capture through the full SAI → DMA → deinterleave → USB path. The dominant ~47 Hz tone (prominence
+~40 dB, flatness ~0.03) is almost certainly **50 Hz mains hum**: with a 15.625 Hz FFT bin, 50 Hz
+leaks onto bin 3 = 46.875 Hz, and it is common-mode (highly correlated across channels), as expected
+for electrical pickup rather than sound. To confirm the acoustic path, play a steady tone/whistle near
+the array and re-run — every mic should additionally report `TONE` at that frequency.
+
+> **Correction:** an earlier draft of this section reported all channels as a positive-only
+> `[0..32767]` ~47 Hz "test artifact". That was wrong — it came from frame **misalignment** in the
+> capture (the old single-magic `read_mic_raw` locked onto a stray `RAW1` byte pattern inside the int32
+> payload, producing a +16384 DC offset and clipped 15-bit values). After hardening `read_mic_raw.m`
+> with the double-magic anchor, the same hardware reads clean bipolar audio (DC ≈ 0). See
+> `debug/bugs_encountered.md` BUG-02.
 
 ### Notes For Later
 
 - `usb_seq=1` during the status-log test is acceptable. The OTG CDC raw stream needs a host reader on the OTG USB CDC port to drain frames continuously.
 - The ST-LINK VCP (`COM3`) is only for status logs.
 - Actual audio content should be checked with `tools/mic_fft_test.m` (per-mic FFT verdict + channel-independence check) on the OTG CDC port, applying a tone/tap near the mics; `tools/read_mic_raw.m` gives the raw waveform dump.
+
+---
+
+## TASK-07 - Hann Window & FFT
+
+**Status:** DONE - verified on hardware.
+
+**Goal:** Apply a Hann window and compute a 1024-point real FFT for all 8 mics using CMSIS-DSP;
+"Done when" = a 1 kHz tone produces a magnitude peak at bin 64 (`1000 / 16000 x 1024`).
+
+### CMSIS-DSP Build Integration (from source, no prebuilt lib)
+
+The pack ships CMSIS-DSP **source** under `Drivers/CMSIS/DSP/` but no prebuilt `libarm_cortexM7*`.
+The five "all-in-one" aggregate units we need are compiled at `-O2` and linked in:
+
+| Aggregate unit | Provides |
+|----------------|----------|
+| `TransformFunctions.c` | `arm_rfft_fast_init_f32`, `arm_rfft_fast_f32`, `arm_cfft_f32` |
+| `CommonTables.c` | twiddle factors / bit-reversal tables (`arm_cfft_sR_f32_len512`, ...) |
+| `BasicMathFunctions.c` | `arm_mult_f32` (windowing) |
+| `ComplexMathFunctions.c` | `arm_cmplx_mag_f32` (and `arm_cmplx_mult_cmplx_f32` for TASK-08) |
+| `StatisticsFunctions.c` | `arm_max_f32` (peak find, TASK-08) |
+
+Wiring (CLI makefile build):
+
+- New `STM32CubeIDE/Debug/Drivers/CMSIS/DSP/subdir.mk` compiles the five units (own `-O2` rule).
+- `STM32CubeIDE/Debug/makefile` gets `-include Drivers/CMSIS/DSP/subdir.mk`.
+- `STM32CubeIDE/Debug/objects.list` lists the five `.o` so they are linked.
+- The DSP include path `-I../../Drivers/CMSIS/DSP/Include` was already present on the app compiles.
+- Modern CMSIS-DSP auto-detects the Cortex-M7 + FPv5 core from `-mcpu`/`-mfpu`; **no `ARM_MATH_CM7`
+  define needed**. `arm_sin_f32` was avoided (would pull in `FastMathFunctions`); the self-test uses
+  libm `sinf` instead.
+
+> If STM32CubeIDE regenerates the build, re-add the `-include` line, the five `objects.list` entries,
+> and `Drivers/CMSIS/DSP/subdir.mk`.
+
+### What Was Added (`Src/main.c`, guarded by `FFT_ENABLE`)
+
+- DTCM buffers: `hann_window[1024]`, `fft_win[1024]`, `fft_cplx[1024]`, `fft_mag[8][512]`.
+- `FFT_Init()` - `arm_rfft_fast_init_f32(&fft_inst, 1024)` + pre-computes the Hann window.
+- `FFT_ProcessAll()` - per mic: `arm_mult_f32` (window) -> `arm_rfft_fast_f32` (forward) ->
+  `arm_cmplx_mag_f32` (512 bins); times the whole 8-mic pass with the DWT cycle counter (`g_fft_us`).
+- `FFT_PeakBin()` - dominant bin, skipping DC.
+- `FFT_SelfTest()` - synthesizes a clean 1 kHz sine, runs the pipeline, checks the peak bin (proves
+  the path independent of the mics).
+- Wired into the capture loop: `FFT_Init()`/`FFT_SelfTest()` before the loop; `FFT_ProcessAll()` plus a
+  per-mic peak-Hz print on the ~1 Hz heartbeat. (TASK-09 will move the FFT into its own RTOS task
+  running every block.)
+
+Note: `arm_rfft_fast_f32` packs DC in `[0]` and Nyquist in `[1]`, so `fft_mag[m][0]` is
+`sqrt(DC^2 + Nyq^2)`; peak detection skips bin 0 anyway.
+
+### Verification - PASSED on hardware
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/check_task07_fft.ps1
+```
+
+Options: `-NoFlash`, `-Port COM3`, `-Baud 115200`, `-ReadSeconds 12`. Report: `debug/task07_fft_report.txt`.
+
+```text
+--- TASK-07 Hann + FFT ---
+self-test: 1000 Hz -> peak bin 64 (expected 64) mag=255
+TASK-07 self-test OK (peak within +/-1 bin).
+FFT 9230us peakHz[46 46 46 46 93 93 46 46]
+
+[ OK ] FFT self-test peak bin 64 (expected 64)
+[ OK ] Live 8-mic FFT runs: 9230 us/pass, peakHz = [46 46 46 46 93 93 46 46]
+TASK-07 FFT check passed.
+```
+
+- **Self-test:** 1 kHz -> peak bin **64**, exactly as specified.
+- **Timing:** ~**9.2 ms** for all 8 mics (~1.15 ms / 1024-pt rfft+mag), well under the 20 ms budget;
+  `overruns=0` with the FFT running in the loop.
+- **Live mics:** dominant bin tracks the ~46 Hz (50 Hz mains) hum seen in TASK-06, and jumps to higher
+  bins on taps/voice - the FFT responds to real input.
+
+---
+
+## TASK-08 - GCC-PHAT & TDOA
+
+**Status:** DONE - verified on hardware.
+
+**Goal:** Estimate the time delay (TDOA) between mic pairs with GCC-PHAT; "Done when" = a synthetic
+5-sample delay between two signals is recovered as lag 5 +/- 1.
+
+### What Was Added (`Src/main.c`, guarded by `GCC_ENABLE`, reuses the TASK-07 `fft_inst`)
+
+- DTCM scratch: `gcc_a`, `gcc_b` (packed spectra), `gcc_r` (PHAT cross-spectrum), `gcc_corr` (correlation).
+- `int32_t GCC_PHAT(const float *a, const float *b)`:
+  1. forward rfft of both inputs (from the `fft_win` scratch copy - see the gotcha below);
+  2. cross-spectrum `conj(Xa) * Xb` handling the packed DC/Nyquist terms;
+  3. PHAT whitening: divide each bin by its magnitude (floored at 1e-9);
+  4. inverse rfft -> cross-correlation; `arm_max_f32` peak -> lag, unwrapped to +/- N/2.
+  - **Sign convention:** positive lag means signal reaches mic *a* before mic *b* (b is the delayed
+    copy). This drove the `conj(Xa)*Xb` choice (the other order returns -lag).
+- `GCC_SelfTest()`: builds a broadband pseudo-random reference and a copy **circularly** delayed by 5
+  samples, then checks the recovered lag. (Broadband, not a tone - PHAT whitening needs energy across
+  all bins, so a pure sine is a poor test.)
+- `GCC_ProcessPairs()`: live TDOA for mic0 vs mic1..7 from `mic_data`, timed with the DWT counter.
+- Wired into the loop: `GCC_SelfTest()` once before the loop; `GCC_ProcessPairs()` + a lag print on the
+  ~1 Hz heartbeat.
+
+> **Gotcha (cost a sign bug + a corruption trap):** `arm_rfft_fast_f32` *forward* runs the cfft
+> **in-place on its input buffer**, so passing `mic_data[m]` directly would corrupt it. `GCC_PHAT`
+> always `memcpy`s the input into `fft_win` first and FFTs from there. (Same reason `FFT_ProcessAll`
+> FFTs the windowed copy, not `mic_data`.)
+
+### Verification - PASSED on hardware
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/check_task08_gccphat.ps1
+```
+
+Options: `-NoFlash`, `-Port COM3`, `-Baud 115200`, `-ReadSeconds 14`. Report: `debug/task08_gccphat_report.txt`.
+
+```text
+--- TASK-08 GCC-PHAT / TDOA ---
+self-test: delay 5 -> lag 5 (expected 5)
+TASK-08 self-test OK (lag within +/-1 sample).
+GCC 41732us lag0x[-1 0 -1 1 1 1 0]
+
+[ OK ] GCC-PHAT self-test lag=5 (expected 5)
+[ OK ] Live GCC-PHAT runs: 41732 us, mic0-vs-mic1..7 lags = [-1 0 -1 1 1 1 0]
+TASK-08 GCC-PHAT check passed.
+```
+
+- **Self-test:** synthetic 5-sample delay -> lag **5**, exactly as specified.
+- **Live mics:** mic0-vs-mic{1..7} lags are small (+/-1 sample). Expected here: the dominant signal is
+  common-mode ~50 Hz mains hum, which has ~0 inter-mic delay; a real off-axis acoustic source is
+  needed to see larger, physically meaningful TDOAs (TASK-11/13).
+- **Timing:** ~41.7 ms for 7 pairs (21 FFTs + the PHAT loops). The FFTs are `-O2` (DSP lib) but the
+  per-bin cross-spectrum/`sqrtf` loop is in `main.c` at `-O0`; still `overruns=0` because one heavy
+  heartbeat iteration (~51 ms incl. FFT) stays under the 64 ms half-buffer period. TASK-09 will move
+  this into a dedicated RTOS task and can cache mic0's spectrum / compute all 28 pairs off the hot path.

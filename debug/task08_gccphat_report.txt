@@ -1,0 +1,65 @@
+TASK-08 GCC-PHAT / TDOA report
+Generated: 2026-06-01 01:42:34
+
+TASK-08 GCC-PHAT / TDOA Verify
+ELF : C:\Users\huybu\OneDrive\Máy tính\code_TN\STM32CubeIDE\Debug\code_ver2_Fs16khz.elf
+Port: COM3 @ 115200
+
+Flashing firmware and resetting...
+      -------------------------------------------------------------------
+                       STM32CubeProgrammer v2.22.0                  
+      -------------------------------------------------------------------
+
+ST-LINK SN  : 003500503132510838363431
+ST-LINK FW  : V3J17M10
+Board       : NUCLEO-H7A3ZI-Q
+Voltage     : 3.29V
+SWD freq    : 8000 KHz
+Connect mode: Under Reset
+Reset mode  : Hardware reset
+Device ID   : 0x480
+Revision ID : Rev X
+Device name : STM32H7A/B
+NVM size  : 2 MBytes
+Device type : MCU
+Device CPU  : Cortex-M7
+BL Version  : 0x92
+
+
+
+Opening and parsing file: code_ver2_Fs16khz.elf
+
+
+Memory Programming ...
+  File          : code_ver2_Fs16khz.elf
+  Size          : 156.84 KB 
+  Address       : 0x08000000
+
+
+Erasing memory corresponding to segment 0:
+Erasing internal memory sectors [0 19]
+Download in Progress:
+?????????????????????????????????????????????????? 0%
+?????????????????????????????????????????????????? 100%
+
+File download complete
+Time elapsed during download operation: 00:00:00.558
+
+MCU Reset
+
+Software reset is performed
+
+Reading COM3 for up to 14 s (self-test + 1 live GCC line)...
+
+----- VCP output (excerpt) -----
+--- TASK-08 GCC-PHAT / TDOA ---
+self-test: delay 5 -> lag 5 (expected 5)
+TASK-08 self-test OK (lag within +/-1 sample).
+GCC 41732us lag0x[-1 0 -1 1 1 1 0]
+--------------------------------
+
+[ OK ] GCC-PHAT self-test lag=5 (expected 5)
+[ OK ] Live GCC-PHAT runs: 41732 us, mic0-vs-mic1..7 lags = [-1 0 -1 1 1 1 0]
+
+TASK-08 GCC-PHAT check passed.
+Report written to: C:\Users\huybu\OneDrive\Máy tính\code_TN\debug\task08_gccphat_report.txt

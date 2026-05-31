@@ -89,8 +89,19 @@ function [data, seq, info] = read_mic_raw(port, nframes, timeout_s)
             end
 
             frameLen = HDR + nch * nsamp * 4;
-            if numel(buf) < frameLen
-                break;
+            if numel(buf) < frameLen + numel(MAGIC)
+                break;   % need the next frame's magic to confirm this boundary
+            end
+
+            % Reject a stray "RAW1" inside the int32 payload: a genuine frame is
+            % followed by another magic exactly one frame later. Without this a
+            % coincidental magic in the samples desyncs the parser (seen as huge /
+            % bipolar "samples" carrying the 0x52415731 bytes).
+            if ~isequal(buf(frameLen+1:frameLen+numel(MAGIC)), MAGIC(:))
+                info.badFrames = info.badFrames + 1;
+                info.droppedBytes = info.droppedBytes + 1;
+                buf = buf(2:end);
+                continue;
             end
 
             payload = buf(HDR+1:frameLen);
