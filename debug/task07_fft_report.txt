@@ -1,0 +1,65 @@
+TASK-07 Hann + FFT report
+Generated: 2026-06-01 01:30:50
+
+TASK-07 Hann + FFT Verify
+ELF : C:\Users\huybu\OneDrive\Máy tính\code_TN\STM32CubeIDE\Debug\code_ver2_Fs16khz.elf
+Port: COM3 @ 115200
+
+Flashing firmware and resetting...
+      -------------------------------------------------------------------
+                       STM32CubeProgrammer v2.22.0                  
+      -------------------------------------------------------------------
+
+ST-LINK SN  : 003500503132510838363431
+ST-LINK FW  : V3J17M10
+Board       : NUCLEO-H7A3ZI-Q
+Voltage     : 3.29V
+SWD freq    : 8000 KHz
+Connect mode: Under Reset
+Reset mode  : Hardware reset
+Device ID   : 0x480
+Revision ID : Rev X
+Device name : STM32H7A/B
+NVM size  : 2 MBytes
+Device type : MCU
+Device CPU  : Cortex-M7
+BL Version  : 0x92
+
+
+
+Opening and parsing file: code_ver2_Fs16khz.elf
+
+
+Memory Programming ...
+  File          : code_ver2_Fs16khz.elf
+  Size          : 155.63 KB 
+  Address       : 0x08000000
+
+
+Erasing memory corresponding to segment 0:
+Erasing internal memory sectors [0 19]
+Download in Progress:
+?????????????????????????????????????????????????? 0%
+?????????????????????????????????????????????????? 100%
+
+File download complete
+Time elapsed during download operation: 00:00:00.551
+
+MCU Reset
+
+Software reset is performed
+
+Reading COM3 for up to 12 s (waiting for self-test + 1 FFT line)...
+
+----- VCP output (excerpt) -----
+--- TASK-07 Hann + FFT ---
+self-test: 1000 Hz -> peak bin 64 (expected 64) mag=255
+TASK-07 self-test OK (peak within +/-1 bin).
+FFT 9230us peakHz[46 46 46 46 93 93 46 46]
+--------------------------------
+
+[ OK ] FFT self-test peak bin 64 (expected 64)
+[ OK ] Live 8-mic FFT runs: 9230 us/pass, peakHz = [46 46 46 46 93 93 46 46]
+
+TASK-07 FFT check passed.
+Report written to: C:\Users\huybu\OneDrive\Máy tính\code_TN\debug\task07_fft_report.txt

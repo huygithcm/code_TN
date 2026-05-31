@@ -21,14 +21,19 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "FreeRTOS.h"
+#include "cmsis_os2.h"
+#include "task.h"
 #include "usb_device.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include "usbd_cdc_if.h"
 #include "usbd_cdc.h"
+#include "arm_math.h"        /* TASK-07: CMSIS-DSP (rfft, windowing, magnitude) */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -54,6 +59,31 @@
 #define RAW_HDR_BYTES        12U                         /* magic(4)+seq(4)+nch(1)+nsamp(2)+fmt(1)    */
 #define RAW_PAYLOAD_BYTES    (RAW_NCH * RAW_NSAMP * 4U)  /* int32 channel-major                       */
 #define USB_FRAME_LEN        (RAW_HDR_BYTES + RAW_PAYLOAD_BYTES)
+
+/* TASK-07: Hann window + 1024-point real FFT (CMSIS-DSP) for all 8 mics. */
+#define FFT_ENABLE           1
+#define FFT_SIZE             AUDIO_BLOCK_SAMPLES          /* 1024-point FFT             */
+#define FFT_BINS             (FFT_SIZE / 2U)              /* 512 magnitude bins         */
+#define AUDIO_FS_HZ          16000U                       /* sample rate (see CLAUDE.md)*/
+#define FFT_SELFTEST_HZ      1000.0f                      /* self-test tone -> bin 64   */
+#define PI_F                 3.14159265358979f
+
+/* TASK-08: GCC-PHAT time-delay estimation between mic pairs. */
+#define GCC_ENABLE           1
+#define GCC_SELFTEST_SHIFT   5                            /* synthetic delay -> lag 5   */
+#define GCC_NPAIRS_LIVE      (NUM_MIC_CHANNELS - 1U)      /* live demo: mic0 vs mic1..7 */
+
+/* TASK-09: FreeRTOS task notification flags (FFT_Task waits on these). */
+#define FLAG_FFT             (1UL << 0)                   /* a fresh half is ready      */
+#define FLAG_USB             (1UL << 1)                   /* build+send a USB raw frame */
+
+/* TASK-09: result_queue payload (BUG-05) - the per-pair TDOA lags one FFT_Task pass
+ * produces, handed to DOA_Task. seq lets DOA_Task spot dropped results. */
+typedef struct
+{
+  uint32_t seq;                       /* processed-block counter            */
+  int32_t  lag[GCC_NPAIRS_LIVE];      /* mic0 vs mic1..7, samples           */
+} tdoa_result_t;
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -74,6 +104,47 @@ DMA_HandleTypeDef hdma_sai1_b;
 DMA_HandleTypeDef hdma_sai2_a;
 DMA_HandleTypeDef hdma_sai2_b;
 
+/* Definitions for defaultTask */
+osThreadId_t defaultTaskHandle;
+const osThreadAttr_t defaultTask_attributes = {
+  .name = "defaultTask",
+  .stack_size = 128 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+/* Definitions for FFT_Task */
+/* TASK-09 (BUG-06): FFT/GCC pipeline + printf needs a deep stack; 2048 words. */
+osThreadId_t FFT_TaskHandle;
+const osThreadAttr_t FFT_Task_attributes = {
+  .name = "FFT_Task",
+  .stack_size = 2048 * 4,
+  .priority = (osPriority_t) osPriorityHigh,
+};
+/* Definitions for USB_Task */
+osThreadId_t USB_TaskHandle;
+const osThreadAttr_t USB_Task_attributes = {
+  .name = "USB_Task",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityRealtime,
+};
+/* Definitions for DOA_Task */
+osThreadId_t DOA_TaskHandle;
+const osThreadAttr_t DOA_Task_attributes = {
+  .name = "DOA_Task",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityAboveNormal,
+};
+/* Definitions for Monitor_Task */
+osThreadId_t Monitor_TaskHandle;
+const osThreadAttr_t Monitor_Task_attributes = {
+  .name = "Monitor_Task",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityLow,
+};
+/* Definitions for result_queue */
+osMessageQueueId_t result_queueHandle;
+const osMessageQueueAttr_t result_queue_attributes = {
+  .name = "result_queue"
+};
 /* USER CODE BEGIN PV */
 /* Raw SAI capture buffers, one per DMA stream, in RAM_D1 (.DMASection).
  * Circular double buffer: first/second half are drained in the DMA HT/TC callbacks.
@@ -106,6 +177,52 @@ uint32_t g_usb_seq;                 /* raw frames successfully queued to USB    
 uint8_t  usb_tx_frame[USB_FRAME_LEN];
 extern USBD_HandleTypeDef hUsbDeviceHS;
 #endif
+
+#if FFT_ENABLE
+/* TASK-07 FFT working set, all in DTCM for fast CPU/FPU access.
+ * hann_window : pre-computed once. fft_win : windowed input (overwritten per mic).
+ * fft_cplx    : rfft_fast output (packed real spectrum, 1024 floats).
+ * fft_mag     : per-mic magnitude spectrum (512 bins). */
+__attribute__((section(".DTCMSection"), aligned(32), used))
+float   hann_window[FFT_SIZE];
+__attribute__((section(".DTCMSection"), aligned(32), used))
+float   fft_win[FFT_SIZE];
+__attribute__((section(".DTCMSection"), aligned(32), used))
+float   fft_cplx[FFT_SIZE];
+__attribute__((section(".DTCMSection"), aligned(32), used))
+float   fft_mag[NUM_MIC_CHANNELS][FFT_BINS];
+
+static arm_rfft_fast_instance_f32 fft_inst;
+volatile uint32_t g_fft_us;        /* last 8-mic FFT compute time (microseconds) */
+
+#if GCC_ENABLE
+/* TASK-08 GCC-PHAT scratch (DTCM). gcc_a/gcc_b: packed spectra of the two inputs;
+ * gcc_r: PHAT-weighted cross-spectrum; gcc_corr: time-domain cross-correlation. */
+__attribute__((section(".DTCMSection"), aligned(32), used))
+float   gcc_a[FFT_SIZE];
+__attribute__((section(".DTCMSection"), aligned(32), used))
+float   gcc_b[FFT_SIZE];
+__attribute__((section(".DTCMSection"), aligned(32), used))
+float   gcc_r[FFT_SIZE];
+__attribute__((section(".DTCMSection"), aligned(32), used))
+float   gcc_corr[FFT_SIZE];
+
+volatile int32_t  g_tdoa_lag[GCC_NPAIRS_LIVE];  /* mic0 vs mic(k+1), samples */
+volatile uint32_t g_gcc_us;                     /* time to compute the live pairs (us) */
+#endif
+#endif
+
+/* TASK-09: USB_Task signalling. FFT_Task snapshots one freshly deinterleaved frame
+ * into usb_snapshot under USB_Task's nose, then notifies it to send. The snapshot
+ * decouples the (slow) USB transfer from the DSP buffers it would otherwise race.
+ * Placed in AXI SRAM (not DTCM) - it is 32 KB and not on the DSP hot path, and DTCM
+ * is already nearly full with mic_data/mic_raw/fft/gcc buffers. */
+#if USB_RAW_STREAM
+__attribute__((section(".DMASection"), aligned(32), used))
+int32_t  usb_snapshot[NUM_MIC_CHANNELS][AUDIO_BLOCK_SAMPLES];
+volatile uint8_t g_usb_snapshot_valid;
+#endif
+volatile uint32_t g_blocks;                     /* processed-block counter (Monitor)  */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -116,11 +233,29 @@ static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_SAI1_Init(void);
 static void MX_SAI2_Init(void);
+void StartDefaultTask(void *argument);
+void StartTask02(void *argument);
+void StartTask03(void *argument);
+void StartTask04(void *argument);
+void StartTask05(void *argument);
+
 /* USER CODE BEGIN PFP */
 void Clock_Verify(void);
 void SAI_Verify(void);
 void Audio_Start(void);
 static void Deinterleave_Pair(uint32_t off, uint8_t pair);
+#if FFT_ENABLE
+void FFT_Init(void);
+void FFT_ProcessAll(void);
+void FFT_SelfTest(void);
+static uint32_t FFT_PeakBin(const float *mag, float *peakVal);
+#if GCC_ENABLE
+int32_t GCC_PHAT(const float *a, const float *b);
+void GCC_SelfTest(void);
+void GCC_ProcessPairs(void);
+#endif
+#endif
+void Pipeline_InitOnce(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -171,10 +306,57 @@ int main(void)
   MX_DMA_Init();
   MX_SAI1_Init();
   MX_SAI2_Init();
-  MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
 
   /* USER CODE END 2 */
+
+  /* Init scheduler */
+  osKernelInitialize();
+
+  /* USER CODE BEGIN RTOS_MUTEX */
+  /* add mutexes, ... */
+  /* USER CODE END RTOS_MUTEX */
+
+  /* USER CODE BEGIN RTOS_SEMAPHORES */
+  /* add semaphores, ... */
+  /* USER CODE END RTOS_SEMAPHORES */
+
+  /* USER CODE BEGIN RTOS_TIMERS */
+  /* start timers, add new ones, ... */
+  /* USER CODE END RTOS_TIMERS */
+
+  /* Create the queue(s) */
+  /* creation of result_queue */
+  /* TASK-09 (BUG-05): carry the TDOA result struct, not a bare uint16_t. */
+  result_queueHandle = osMessageQueueNew (4, sizeof(tdoa_result_t), &result_queue_attributes);
+
+  /* USER CODE BEGIN RTOS_QUEUES */
+  /* add queues, ... */
+  /* USER CODE END RTOS_QUEUES */
+
+  /* Create the thread(s) */
+  /* creation of defaultTask */
+  defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
+
+  /* creation of FFT_Task */
+  FFT_TaskHandle = osThreadNew(StartTask02, NULL, &FFT_Task_attributes);
+
+  /* creation of USB_Task */
+  USB_TaskHandle = osThreadNew(StartTask03, NULL, &USB_Task_attributes);
+
+  /* creation of DOA_Task */
+  DOA_TaskHandle = osThreadNew(StartTask04, NULL, &DOA_Task_attributes);
+
+  /* creation of Monitor_Task */
+  Monitor_TaskHandle = osThreadNew(StartTask05, NULL, &Monitor_Task_attributes);
+
+  /* USER CODE BEGIN RTOS_THREADS */
+  /* add threads, ... */
+  /* USER CODE END RTOS_THREADS */
+
+  /* USER CODE BEGIN RTOS_EVENTS */
+  /* add events, ... */
+  /* USER CODE END RTOS_EVENTS */
 
   /* Initialize leds */
   BSP_LED_Init(LED_GREEN);
@@ -195,97 +377,21 @@ int main(void)
     Error_Handler();
   }
 
+  /* Start scheduler */
+  osKernelStart();
+
+  /* We should never get here as control is now taken by the scheduler */
+
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  /* TASK-03: verify clock tree and arm the DWT cycle counter (COM1/VCP now up) */
-  Clock_Verify();
-  /* TASK-04: confirm SAI + DMA init succeeded for all 4 blocks */
-  SAI_Verify();
-
-  /* TASK-05: start the SAI DMA ping-pong capture and confirm callbacks fire */
-  Audio_Start();
-  HAL_Delay(1000);
-  printf("\r\n--- TASK-05 DMA Ping-Pong ---\r\n");
-  uint32_t live = 0U;
-  for (int i = 0; i < (int)NUM_SAI_BLOCKS; i++)
-  {
-    printf("pair%d: half=%lu full=%lu\r\n", i,
-           (unsigned long)dma_half_cnt[i], (unsigned long)dma_full_cnt[i]);
-    if ((dma_half_cnt[i] > 0U) && (dma_full_cnt[i] > 0U)) { live++; }
-  }
-  if (live == NUM_SAI_BLOCKS)
-  {
-    printf("TASK-05 OK: all 4 DMA streams ping-ponging.\r\n");
-  }
-  else
-  {
-    printf("TASK-05 FAIL: %lu/4 streams active.\r\n", (unsigned long)live);
-    BSP_LED_On(LED_RED);
-  }
-
-  /* TASK-06: deinterleave each ready half into per-mic buffers; optionally stream raw to USB. */
-  __disable_irq();
-  g_half_ready = 0U;
-  g_overruns = 0U;
-  __enable_irq();
-
-  printf("\r\n--- TASK-06 Deinterleave%s ---\r\n",
-         USB_RAW_STREAM ? " + raw USB CDC stream" : "");
-  uint32_t blocks = 0U;
-
+  /* TASK-09: the capture + FFT + GCC-PHAT pipeline now lives in the FreeRTOS tasks
+   * (StartTask02..05). osKernelStart() above never returns, so this loop is unused. */
   while (1)
   {
-    if (g_half_ready)
-    {
-      uint32_t off = (g_ready_half != 0U) ? DMA_HALF_WORDS : 0U;
-      g_half_ready = 0U;
-
-      for (uint8_t p = 0U; p < NUM_SAI_BLOCKS; p++)
-      {
-        Deinterleave_Pair(off, p);
-      }
-      blocks++;
-
-      /* ~1 Hz VCP heartbeat before optional USB work, so USB faults are visible. */
-      if ((blocks % 16U) == 0U)
-      {
-        int32_t mn = mic_raw[0][0], mx = mic_raw[0][0];
-        for (uint32_t i = 1U; i < AUDIO_BLOCK_SAMPLES; i++)
-        {
-          if (mic_raw[0][i] < mn) { mn = mic_raw[0][i]; }
-          if (mic_raw[0][i] > mx) { mx = mic_raw[0][i]; }
-        }
-        printf("blk=%lu mic0[min=%ld max=%ld] usb_seq=%lu overruns=%lu\r\n",
-               (unsigned long)blocks, (long)mn, (long)mx,
-               (unsigned long)g_usb_seq, (unsigned long)g_overruns);
-      }
-
-#if USB_RAW_STREAM
-      /* Only (re)build and send when the previous CDC transfer has finished, so we never
-       * overwrite usb_tx_frame while it is in flight. Frames are dropped if USB is busy. */
-      USBD_CDC_HandleTypeDef *hcdc = (USBD_CDC_HandleTypeDef *)hUsbDeviceHS.pClassData;
-      if ((hcdc != NULL) && (hcdc->TxState == 0U))
-      {
-        uint16_t ns = (uint16_t)RAW_NSAMP;
-        usb_tx_frame[0] = 'R'; usb_tx_frame[1] = 'A'; usb_tx_frame[2] = 'W'; usb_tx_frame[3] = '1';
-        memcpy(&usb_tx_frame[4], &g_usb_seq, 4);
-        usb_tx_frame[8] = (uint8_t)RAW_NCH;
-        usb_tx_frame[9] = (uint8_t)(ns & 0xFFU);
-        usb_tx_frame[10] = (uint8_t)(ns >> 8);
-        usb_tx_frame[11] = 0U;                                   /* fmt 0 = int32 LE          */
-        memcpy(&usb_tx_frame[RAW_HDR_BYTES], mic_raw, RAW_PAYLOAD_BYTES);
-        if (CDC_Transmit_HS(usb_tx_frame, (uint16_t)USB_FRAME_LEN) == USBD_OK)
-        {
-          g_usb_seq++;
-        }
-      }
-#endif
-
-    }
-    /* USER CODE END WHILE */
-
-    /* USER CODE BEGIN 3 */
   }
+  /* USER CODE END WHILE */
+
+  /* USER CODE BEGIN 3 */
   /* USER CODE END 3 */
 }
 
@@ -406,9 +512,9 @@ static void MX_SAI1_Init(void)
   hsai_BlockA1.Init.NoDivider = SAI_MASTERDIVIDER_ENABLE;
   hsai_BlockA1.Init.FIFOThreshold = SAI_FIFOTHRESHOLD_EMPTY;
   hsai_BlockA1.Init.AudioFrequency = SAI_AUDIO_FREQUENCY_16K;
-  /* TASK-05 fix: export SAI1 block A sync (GCR.SYNCOUT) so SAI2 (SYNCHRONOUS_EXT_SAI1)
-   * receives FS/SCK. Must be set on BOTH SAI1 blocks because HAL_SAI_Init rewrites the
-   * shared SAI1->GCR on every call and the last (block B) init would otherwise clear it. */
+  /* TASK-05 fix (re-applied after CubeMX regen, see BUG-08): SAI1 must export its
+   * sync (GCR.SYNCOUT = Block A) so the SAI2 EXT-sync slaves get a clock. Both SAI1
+   * blocks carry it because HAL_SAI_Init rewrites the shared GCR on every call. */
   hsai_BlockA1.Init.SynchroExt = SAI_SYNCEXT_OUTBLOCKA_ENABLE;
   hsai_BlockA1.Init.MonoStereoMode = SAI_STEREOMODE;
   hsai_BlockA1.Init.CompandingMode = SAI_NOCOMPANDING;
@@ -434,6 +540,7 @@ static void MX_SAI1_Init(void)
   hsai_BlockB1.Init.DataSize = SAI_DATASIZE_24;
   hsai_BlockB1.Init.FirstBit = SAI_FIRSTBIT_MSB;
   hsai_BlockB1.Init.ClockStrobing = SAI_CLOCKSTROBING_FALLINGEDGE;
+  /* TASK-05 fix (BUG-08): SAI1_B syncs internally to SAI1_A, not to SAI2. */
   hsai_BlockB1.Init.Synchro = SAI_SYNCHRONOUS;
   hsai_BlockB1.Init.OutputDrive = SAI_OUTPUTDRIVE_DISABLE;
   hsai_BlockB1.Init.FIFOThreshold = SAI_FIFOTHRESHOLD_EMPTY;
@@ -551,16 +658,16 @@ static void MX_DMA_Init(void)
 
   /* DMA interrupt init */
   /* DMA1_Stream0_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
   /* DMA1_Stream1_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Stream1_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA1_Stream1_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream1_IRQn);
   /* DMA1_Stream2_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Stream2_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA1_Stream2_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream2_IRQn);
   /* DMA1_Stream3_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Stream3_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA1_Stream3_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream3_IRQn);
 
 }
@@ -708,17 +815,29 @@ static uint8_t Audio_GetPair(SAI_HandleTypeDef *hsai)
  * half boundary every slave has already written the same half. We trigger the
  * deinterleave for all pairs off the master's callback (serviced first: it is
  * DMA1_Stream0, the lowest IRQ number). */
+/* TASK-09: notify FFT_Task that a fresh half (PING/PONG) is ready. Runs in the
+ * DMA IRQ at preempt priority 5 (>= configMAX_SYSCALL_INTERRUPT_PRIORITY), so the
+ * FromISR API is legal. The deinterleave + DSP happen in FFT_Task, not here. */
+static void Audio_NotifyHalfReady(uint8_t half)
+{
+  if (g_half_ready) { g_overruns++; }     /* FFT_Task didn't consume the last one */
+  g_ready_half = half;
+  g_half_ready = 1U;
+
+  if (FFT_TaskHandle != NULL)
+  {
+    BaseType_t woken = pdFALSE;
+    xTaskNotifyFromISR((TaskHandle_t)FFT_TaskHandle, FLAG_FFT, eSetBits, &woken);
+    portYIELD_FROM_ISR(woken);
+  }
+}
+
 void HAL_SAI_RxHalfCpltCallback(SAI_HandleTypeDef *hsai)
 {
   uint8_t p = Audio_GetPair(hsai);
   if (p == 0xFFU) { return; }
   dma_half_cnt[p]++;
-  if (p == 0U)                       /* master block */
-  {
-    if (g_half_ready) { g_overruns++; }
-    g_ready_half = 0U;               /* PING */
-    g_half_ready = 1U;
-  }
+  if (p == 0U) { Audio_NotifyHalfReady(0U); }   /* master block, PING */
 }
 
 /* DMA transfer-complete: second half (PONG) of the circular buffer is full. */
@@ -727,12 +846,7 @@ void HAL_SAI_RxCpltCallback(SAI_HandleTypeDef *hsai)
   uint8_t p = Audio_GetPair(hsai);
   if (p == 0xFFU) { return; }
   dma_full_cnt[p]++;
-  if (p == 0U)                       /* master block */
-  {
-    if (g_half_ready) { g_overruns++; }
-    g_ready_half = 1U;               /* PONG */
-    g_half_ready = 1U;
-  }
+  if (p == 0U) { Audio_NotifyHalfReady(1U); }   /* master block, PONG */
 }
 
 /* Deinterleave one stereo pair's half-buffer into the two per-mic arrays.
@@ -745,8 +859,8 @@ static void Deinterleave_Pair(uint32_t off, uint8_t pair)
   uint8_t r = (uint8_t)(pair * 2U + 1U);
   for (uint32_t i = 0U; i < AUDIO_BLOCK_SAMPLES; i++)
   {
-    int32_t rl = src[2U * i]      >> 8;
-    int32_t rr = src[2U * i + 1U] >> 8;
+    int32_t rl = (int16_t)(src[2U * i] & 0xFFFF);
+    int32_t rr = (int16_t)(src[2U * i + 1U] & 0xFFFF);
     mic_raw[l][i]  = rl;
     mic_raw[r][i]  = rr;
     mic_data[l][i] = (float)rl * (1.0f / 8388608.0f);
@@ -775,7 +889,394 @@ void Audio_Start(void)
   if (HAL_SAI_Receive_DMA(&hsai_BlockA1, (uint8_t *)dma_buf[0], DMA_FULL_WORDS) != HAL_OK) { Error_Handler(); }
 }
 
+#if FFT_ENABLE
+/**
+  * @brief  TASK-07 - initialise the real-FFT instance and pre-compute the Hann
+  *         window once. Called before the capture loop starts using the FFT.
+  */
+void FFT_Init(void)
+{
+  arm_rfft_fast_init_f32(&fft_inst, FFT_SIZE);
+  for (uint32_t i = 0U; i < FFT_SIZE; i++)
+  {
+    hann_window[i] = 0.5f * (1.0f - cosf((2.0f * PI_F * (float)i) / (float)(FFT_SIZE - 1U)));
+  }
+}
+
+/* Find the dominant magnitude bin, skipping DC (bin 0). Returns the bin index
+ * and writes its magnitude to *peakVal. */
+static uint32_t FFT_PeakBin(const float *mag, float *peakVal)
+{
+  float    best = mag[1];
+  uint32_t bin  = 1U;
+  for (uint32_t k = 2U; k < FFT_BINS; k++)
+  {
+    if (mag[k] > best) { best = mag[k]; bin = k; }
+  }
+  *peakVal = best;
+  return bin;
+}
+
+/**
+  * @brief  TASK-07 - window + 1024-pt real FFT + magnitude for all 8 mics.
+  *         Reads mic_data[m][] (float, normalized), writes fft_mag[m][0..511].
+  *         Times the whole 8-mic pass with the DWT cycle counter.
+  */
+void FFT_ProcessAll(void)
+{
+  uint32_t t0 = DWT->CYCCNT;
+  for (uint32_t m = 0U; m < NUM_MIC_CHANNELS; m++)
+  {
+    arm_mult_f32(mic_data[m], hann_window, fft_win, FFT_SIZE);
+    arm_rfft_fast_f32(&fft_inst, fft_win, fft_cplx, 0U);   /* forward */
+    /* rfft_fast packs DC in [0] and Nyquist in [1]; mag[0] is sqrt(DC^2+Nyq^2),
+     * which we ignore for peak detection anyway. */
+    arm_cmplx_mag_f32(fft_cplx, fft_mag[m], FFT_BINS);
+  }
+  g_fft_us = (DWT->CYCCNT - t0) / (AUDIO_FS_HZ == 16000U ? 64U : 64U); /* cycles@64MHz -> us */
+}
+
+/**
+  * @brief  TASK-07 - self-test independent of the mics: synthesize a clean
+  *         1 kHz sine, run it through the FFT pipeline, and confirm the peak
+  *         lands on the expected bin (1000/16000*1024 = 64). Proves the window,
+  *         rfft and magnitude path are correct before trusting live mic input.
+  */
+void FFT_SelfTest(void)
+{
+  for (uint32_t i = 0U; i < FFT_SIZE; i++)
+  {
+    fft_win[i] = sinf((2.0f * PI_F * FFT_SELFTEST_HZ * (float)i) / (float)AUDIO_FS_HZ);
+  }
+  arm_mult_f32(fft_win, hann_window, fft_win, FFT_SIZE);
+  arm_rfft_fast_f32(&fft_inst, fft_win, fft_cplx, 0U);
+  arm_cmplx_mag_f32(fft_cplx, fft_mag[0], FFT_BINS);
+
+  float    pk;
+  uint32_t bin = FFT_PeakBin(fft_mag[0], &pk);
+  uint32_t expBin = (uint32_t)((FFT_SELFTEST_HZ * (float)FFT_SIZE) / (float)AUDIO_FS_HZ + 0.5f);
+
+  printf("\r\n--- TASK-07 Hann + FFT ---\r\n");
+  printf("self-test: %d Hz -> peak bin %lu (expected %lu) mag=%ld\r\n",
+         (int)FFT_SELFTEST_HZ, (unsigned long)bin, (unsigned long)expBin, (long)pk);
+  if ((bin + 1U >= expBin) && (bin <= expBin + 1U))
+  {
+    printf("TASK-07 self-test OK (peak within +/-1 bin).\r\n");
+  }
+  else
+  {
+    printf("TASK-07 self-test FAIL (peak bin off).\r\n");
+    BSP_LED_On(LED_RED);
+  }
+}
+
+#if GCC_ENABLE
+/**
+  * @brief  TASK-08 - GCC-PHAT time-delay estimate between two real signals.
+  *         Returns the lag in samples; positive lag means signal b is a delayed
+  *         copy of a (a arrives first). Valid range +/- FFT_SIZE/2.
+  *
+  *  r[n] = IFFT( Xa . conj(Xb) / |Xa . conj(Xb)| )  -> peak index is the delay.
+  *  PHAT whitening (divide by magnitude) sharpens the peak and makes it robust to
+  *  the source spectrum. Note arm_rfft_fast_f32 (forward) overwrites its input, so
+  *  we FFT from the fft_win scratch copy, never from the caller's array.
+  */
+int32_t GCC_PHAT(const float *a, const float *b)
+{
+  memcpy(fft_win, a, sizeof(float) * FFT_SIZE);
+  arm_rfft_fast_f32(&fft_inst, fft_win, gcc_a, 0U);
+  memcpy(fft_win, b, sizeof(float) * FFT_SIZE);
+  arm_rfft_fast_f32(&fft_inst, fft_win, gcc_b, 0U);
+
+  /* Packed format: [0] = DC (real), [1] = Nyquist (real), then (re,im) per bin.
+   * For the two real-only terms, conj(Xa).Xb is just the product; PHAT -> sign. */
+  gcc_r[0] = (gcc_a[0] * gcc_b[0] >= 0.0f) ? 1.0f : -1.0f;
+  gcc_r[1] = (gcc_a[1] * gcc_b[1] >= 0.0f) ? 1.0f : -1.0f;
+
+  for (uint32_t k = 1U; k < FFT_BINS; k++)
+  {
+    float ar = gcc_a[2U * k], ai = gcc_a[2U * k + 1U];
+    float br = gcc_b[2U * k], bi = gcc_b[2U * k + 1U];
+    /* conj(Xa) * Xb = (ar - j ai)(br + j bi); peak at +D when b lags a by D
+     * (positive lag => signal reaches mic a before mic b). */
+    float re = ar * br + ai * bi;
+    float im = ar * bi - ai * br;
+    float mag = sqrtf(re * re + im * im);
+    if (mag < 1e-9f) { mag = 1e-9f; }
+    gcc_r[2U * k]      = re / mag;
+    gcc_r[2U * k + 1U] = im / mag;
+  }
+
+  arm_rfft_fast_f32(&fft_inst, gcc_r, gcc_corr, 1U);   /* inverse -> correlation */
+
+  float    maxVal;
+  uint32_t maxIdx;
+  arm_max_f32(gcc_corr, FFT_SIZE, &maxVal, &maxIdx);
+
+  int32_t lag = (int32_t)maxIdx;
+  if (lag > (int32_t)(FFT_SIZE / 2U)) { lag -= (int32_t)FFT_SIZE; }
+  return lag;
+}
+
+/**
+  * @brief  TASK-08 - verify GCC-PHAT independent of the mics: build a broadband
+  *         pseudo-random reference, make a copy circularly delayed by
+  *         GCC_SELFTEST_SHIFT samples, and confirm the estimated lag matches.
+  *         (Broadband, not a pure tone: PHAT whitening needs energy across bins.)
+  */
+void GCC_SelfTest(void)
+{
+  uint32_t lcg = 22695477U;
+  for (uint32_t n = 0U; n < FFT_SIZE; n++)
+  {
+    lcg = lcg * 1103515245U + 12345U;
+    gcc_a[n] = ((float)(lcg >> 9) / (float)0x400000) - 1.0f;   /* ~[-1,1] */
+  }
+  /* gcc_b[n] = gcc_a[n - SHIFT] circularly -> expected lag = +SHIFT */
+  for (uint32_t n = 0U; n < FFT_SIZE; n++)
+  {
+    uint32_t src = (n + FFT_SIZE - (uint32_t)GCC_SELFTEST_SHIFT) % FFT_SIZE;
+    gcc_b[n] = gcc_a[src];
+  }
+  /* GCC_PHAT consumes a (copied to fft_win) before it overwrites gcc_a/gcc_b. */
+  int32_t lag = GCC_PHAT(gcc_a, gcc_b);
+
+  printf("\r\n--- TASK-08 GCC-PHAT / TDOA ---\r\n");
+  printf("self-test: delay %d -> lag %ld (expected %d)\r\n",
+         GCC_SELFTEST_SHIFT, (long)lag, GCC_SELFTEST_SHIFT);
+  if ((lag >= GCC_SELFTEST_SHIFT - 1) && (lag <= GCC_SELFTEST_SHIFT + 1))
+  {
+    printf("TASK-08 self-test OK (lag within +/-1 sample).\r\n");
+  }
+  else
+  {
+    printf("TASK-08 self-test FAIL (lag off).\r\n");
+    BSP_LED_On(LED_RED);
+  }
+}
+
+/**
+  * @brief  TASK-08 - compute live TDOA lags for mic0 vs mic1..7 from mic_data,
+  *         timing the whole set with the DWT counter.
+  */
+void GCC_ProcessPairs(void)
+{
+  uint32_t t0 = DWT->CYCCNT;
+  for (uint32_t k = 0U; k < GCC_NPAIRS_LIVE; k++)
+  {
+    g_tdoa_lag[k] = GCC_PHAT(mic_data[0], mic_data[k + 1U]);
+  }
+  g_gcc_us = (DWT->CYCCNT - t0) / 64U;   /* cycles @ 64 MHz -> us */
+}
+#endif /* GCC_ENABLE */
+#endif /* FFT_ENABLE */
+
+/**
+  * @brief  TASK-09 - one-time pipeline bring-up, run from FFT_Task before its loop.
+  *         Verifies clocks (arms DWT), SAI+DMA, builds the FFT/Hann + runs the
+  *         TASK-07/08 self-tests, then starts the DMA capture. Doing this inside the
+  *         task (not the abandoned superloop) is what fixes BUG-07/BUG-04b.
+  */
+void Pipeline_InitOnce(void)
+{
+  Clock_Verify();      /* TASK-03: prints clocks + arms DWT->CYCCNT (FFT/GCC timing) */
+  SAI_Verify();        /* TASK-04: all 4 SAI blocks READY */
+
+#if FFT_ENABLE
+  FFT_Init();          /* TASK-07: Hann window + rfft instance */
+  FFT_SelfTest();      /* TASK-07: 1 kHz -> bin 64 */
+#if GCC_ENABLE
+  GCC_SelfTest();      /* TASK-08: synthetic 5-sample delay -> lag 5 */
+#endif
+#endif
+
+  printf("\r\n--- TASK-09 RTOS pipeline ---\r\n");
+  Audio_Start();       /* TASK-05: arm circular DMA on all 4 SAI blocks (slaves first) */
+}
+
 /* USER CODE END 4 */
+
+/* USER CODE BEGIN Header_StartDefaultTask */
+/**
+  * @brief  Function implementing the defaultTask thread.
+  * @param  argument: Not used
+  * @retval None
+  */
+/* USER CODE END Header_StartDefaultTask */
+void StartDefaultTask(void *argument)
+{
+  /* init code for USB_DEVICE */
+  MX_USB_DEVICE_Init();
+  /* USER CODE BEGIN 5 */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END 5 */
+}
+
+/* USER CODE BEGIN Header_StartTask02 */
+/**
+* @brief Function implementing the FFT_Task thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartTask02 */
+void StartTask02(void *argument)
+{
+  /* USER CODE BEGIN StartTask02 */
+  /* FFT_Task owns the pipeline bring-up, then processes one half-buffer per
+   * notification from the SAI master-block DMA callback. */
+  Pipeline_InitOnce();
+
+  for (;;)
+  {
+    uint32_t flags = 0U;
+    /* Block until the DMA ISR signals a fresh PING/PONG half. */
+    if (xTaskNotifyWait(0U, FLAG_FFT, &flags, portMAX_DELAY) != pdTRUE) { continue; }
+
+    uint32_t off = (g_ready_half != 0U) ? DMA_HALF_WORDS : 0U;
+    g_half_ready = 0U;
+
+    for (uint8_t p = 0U; p < NUM_SAI_BLOCKS; p++)
+    {
+      Deinterleave_Pair(off, p);
+    }
+    g_blocks++;
+
+#if FFT_ENABLE
+    FFT_ProcessAll();
+#if GCC_ENABLE
+    GCC_ProcessPairs();
+    /* Hand the TDOA result to DOA_Task (drop if the queue is full). */
+    tdoa_result_t res;
+    res.seq = g_blocks;
+    for (uint32_t k = 0U; k < GCC_NPAIRS_LIVE; k++) { res.lag[k] = g_tdoa_lag[k]; }
+    osMessageQueuePut(result_queueHandle, &res, 0U, 0U);
+#endif
+#endif
+
+#if USB_RAW_STREAM
+    /* Snapshot this frame and ask USB_Task to send it, if the previous one is gone. */
+    if (!g_usb_snapshot_valid)
+    {
+      memcpy(usb_snapshot, mic_raw, sizeof(usb_snapshot));
+      g_usb_snapshot_valid = 1U;
+      if (USB_TaskHandle != NULL)
+      {
+        xTaskNotify((TaskHandle_t)USB_TaskHandle, FLAG_USB, eSetBits);
+      }
+    }
+#endif
+  }
+  /* USER CODE END StartTask02 */
+}
+
+/* USER CODE BEGIN Header_StartTask03 */
+/**
+* @brief Function implementing the USB_Task thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartTask03 */
+void StartTask03(void *argument)
+{
+  /* USER CODE BEGIN StartTask03 */
+#if USB_RAW_STREAM
+  for (;;)
+  {
+    uint32_t flags = 0U;
+    if (xTaskNotifyWait(0U, FLAG_USB, &flags, portMAX_DELAY) != pdTRUE) { continue; }
+    if (!g_usb_snapshot_valid) { continue; }
+
+    /* Only send when the previous CDC transfer finished, else drop this frame. */
+    USBD_CDC_HandleTypeDef *hcdc = (USBD_CDC_HandleTypeDef *)hUsbDeviceHS.pClassData;
+    if ((hcdc != NULL) && (hcdc->TxState == 0U))
+    {
+      uint16_t ns = (uint16_t)RAW_NSAMP;
+      usb_tx_frame[0] = 'R'; usb_tx_frame[1] = 'A'; usb_tx_frame[2] = 'W'; usb_tx_frame[3] = '1';
+      memcpy(&usb_tx_frame[4], &g_usb_seq, 4);
+      usb_tx_frame[8]  = (uint8_t)RAW_NCH;
+      usb_tx_frame[9]  = (uint8_t)(ns & 0xFFU);
+      usb_tx_frame[10] = (uint8_t)(ns >> 8);
+      usb_tx_frame[11] = 0U;                                  /* fmt 0 = int32 LE */
+      memcpy(&usb_tx_frame[RAW_HDR_BYTES], usb_snapshot, RAW_PAYLOAD_BYTES);
+      if (CDC_Transmit_HS(usb_tx_frame, (uint16_t)USB_FRAME_LEN) == USBD_OK)
+      {
+        g_usb_seq++;
+      }
+    }
+    g_usb_snapshot_valid = 0U;   /* free the snapshot for the next frame */
+  }
+#else
+  for (;;) { osDelay(1000); }
+#endif
+  /* USER CODE END StartTask03 */
+}
+
+/* USER CODE BEGIN Header_StartTask04 */
+/**
+* @brief Function implementing the DOA_Task thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartTask04 */
+void StartTask04(void *argument)
+{
+  /* USER CODE BEGIN StartTask04 */
+  /* TASK-09: drain the TDOA result queue. TASK-11 will turn lags into an angle;
+   * for now print one result per second as a liveness/IPC check. */
+  tdoa_result_t res;
+  uint32_t last_print = 0U;
+  for (;;)
+  {
+    if (osMessageQueueGet(result_queueHandle, &res, NULL, portMAX_DELAY) != osOK) { continue; }
+
+    if ((res.seq - last_print) >= 16U)     /* ~1 Hz at 16 blocks/s */
+    {
+      last_print = res.seq;
+      printf("DOA seq=%lu lag[", (unsigned long)res.seq);
+      for (uint32_t k = 0U; k < GCC_NPAIRS_LIVE; k++)
+      {
+        printf("%ld%s", (long)res.lag[k], (k < GCC_NPAIRS_LIVE - 1U) ? " " : "]\r\n");
+      }
+    }
+  }
+  /* USER CODE END StartTask04 */
+}
+
+/* USER CODE BEGIN Header_StartTask05 */
+/**
+* @brief Function implementing the Monitor_Task thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartTask05 */
+void StartTask05(void *argument)
+{
+  /* USER CODE BEGIN StartTask05 */
+  /* TASK-09: liveness + IPC proof. Print the FreeRTOS task list once (the
+   * "Done when" for TASK-09), then a periodic health line. TASK-12 adds the IWDG
+   * refresh and stack high-water reporting here. */
+  static char task_list[480];
+
+  osDelay(1500);   /* let the pipeline self-tests finish printing first */
+
+  vTaskList(task_list);
+  printf("\r\n--- TASK-09 vTaskList ---\r\n");
+  printf("Name          State Prio Stack Num\r\n%s\r\n", task_list);
+
+  for (;;)
+  {
+    printf("[MON] blocks=%lu overruns=%lu fft=%luus gcc=%luus heapFree=%u\r\n",
+           (unsigned long)g_blocks, (unsigned long)g_overruns,
+           (unsigned long)g_fft_us, (unsigned long)g_gcc_us,
+           (unsigned)xPortGetFreeHeapSize());
+    osDelay(2000);
+  }
+  /* USER CODE END StartTask05 */
+}
 
  /* MPU Configuration */
 
@@ -801,31 +1302,31 @@ void MPU_Config(void)
   MPU_InitStruct.IsBufferable = MPU_ACCESS_NOT_BUFFERABLE;
 
   HAL_MPU_ConfigRegion(&MPU_InitStruct);
-
-  /* USER CODE BEGIN MPU_Regions */
-  /* TASK-02: Region 1 — AXI SRAM (RAM_D1, 0x24000000, 1 MB).
-   * Marked Normal/non-cacheable (TEX=001, C=0, B=1) so SAI/DMA writes to
-   * dma_buf are immediately coherent with CPU reads, with no need for
-   * SCB_InvalidateDCache_by_Addr. Region 1 > Region 0 priority, so it
-   * overrides the 4 GB backstop for this range. Covers the full 1024 KB
-   * declared in STM32H7A3ZITXQ_FLASH.ld (dma_buf sits at 0x24002220). */
-  MPU_InitStruct.Enable           = MPU_REGION_ENABLE;
-  MPU_InitStruct.Number           = MPU_REGION_NUMBER1;
-  MPU_InitStruct.BaseAddress      = 0x24000000;
-  MPU_InitStruct.Size             = MPU_REGION_SIZE_1MB;
-  MPU_InitStruct.SubRegionDisable = 0x00;
-  MPU_InitStruct.TypeExtField     = MPU_TEX_LEVEL1;
-  MPU_InitStruct.AccessPermission = MPU_REGION_FULL_ACCESS;
-  MPU_InitStruct.DisableExec      = MPU_INSTRUCTION_ACCESS_DISABLE;
-  MPU_InitStruct.IsShareable      = MPU_ACCESS_NOT_SHAREABLE;
-  MPU_InitStruct.IsCacheable      = MPU_ACCESS_NOT_CACHEABLE;
-  MPU_InitStruct.IsBufferable     = MPU_ACCESS_BUFFERABLE;
-  HAL_MPU_ConfigRegion(&MPU_InitStruct);
-  /* USER CODE END MPU_Regions */
-
   /* Enables the MPU */
   HAL_MPU_Enable(MPU_PRIVILEGED_DEFAULT);
 
+}
+
+/**
+  * @brief  Period elapsed callback in non blocking mode
+  * @note   This function is called  when TIM6 interrupt took place, inside
+  * HAL_TIM_IRQHandler(). It makes a direct call to HAL_IncTick() to increment
+  * a global variable "uwTick" used as application time base.
+  * @param  htim : TIM handle
+  * @retval None
+  */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  /* USER CODE BEGIN Callback 0 */
+
+  /* USER CODE END Callback 0 */
+  if (htim->Instance == TIM6)
+  {
+    HAL_IncTick();
+  }
+  /* USER CODE BEGIN Callback 1 */
+
+  /* USER CODE END Callback 1 */
 }
 
 /**
