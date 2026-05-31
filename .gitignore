@@ -15,3 +15,6 @@ STM32CubeIDE/Release/
 Thumbs.db
 .DS_Store
 *.swp
+
+# --- STM32CubeIDE workspace metadata ---
+.cubeide_ws/

@@ -5,6 +5,103 @@ symptom → root cause → fix. Newest first. Append new entries as they come up
 
 ---
 
+## 2026-06-01 — FreeRTOS bring-up (TASK-09, after CubeMX regenerate)
+
+Found while reviewing the project right after enabling FreeRTOS in CubeMX. The RTOS
+scaffolding (FreeRTOS middleware, TIM6 timebase, lowered NVIC priorities) generated
+correctly, but the regenerate also re-introduced/created the issues below.
+
+### BUG-08 — SAI1 SYNCOUT fix (TASK-05) silently reverted by CubeMX regenerate
+
+- **Where:** `Src/main.c` `MX_SAI1_Init` (lines ~603, ~631).
+- **Symptom (predicted):** SAI2 blocks (pair2/pair3) would go dead again (half=full=0),
+  exactly the TASK-05 failure — SAI2 are `SAI_SYNCHRONOUS_EXT_SAI1` slaves and need
+  SAI1 to export its sync via `GCR.SYNCOUT`.
+- **Root cause:** CubeMX regenerates `MX_SAI1_Init` from the `.ioc`, resetting both
+  SAI1 blocks to `SynchroExt = SAI_SYNCEXT_DISABLE`. The TASK-05 hand-edit
+  (`SAI_SYNCEXT_OUTBLOCKA_ENABLE` on **both** SAI1 A and B) lives only in the generated
+  function, so it is wiped on every regenerate. The `.ioc` still has no
+  "Synchronization Outputs = Block A" setting.
+- **Fix:** re-apply `SynchroExt = SAI_SYNCEXT_OUTBLOCKA_ENABLE` on both SAI1 blocks
+  (it is inside USER-CODE-free generated code, so it must be redone after each regen).
+  Durable fix: set SAI1 "Synchronization Outputs = Block A" in the `.ioc` so CubeMX
+  emits it. (Same root cause as the TASK-05 note in `tasks_done_summary.md`.)
+
+### BUG-07 — Whole capture+FFT+GCC pipeline became dead code after `osKernelStart()`
+
+- **Where:** `Src/main.c` `main()` — `osKernelStart()` at ~line 353; `Audio_Start()`,
+  `FFT_SelfTest()`, `GCC_SelfTest()` and the old `while(1)` superloop at ~365–455.
+- **Symptom (predicted):** firmware boots into the scheduler and runs only the empty
+  CubeMX task stubs (`StartTask02..05` in `Src/freertos.c`); no audio capture, no FFT,
+  no USB stream, no VCP heartbeat — the TASK-05/06/07/08 code never executes.
+- **Root cause:** CubeMX inserts `osKernelStart()` (which never returns) at the end of
+  `main()`, **before** the existing superloop. Everything after it — `Audio_Start`, the
+  self-tests, and the `while(1)` deinterleave/FFT/GCC loop — is unreachable. The
+  generated tasks are empty stubs.
+- **Fix (TASK-09 work, not yet applied):** move `Audio_Start()` + the self-tests into
+  task init; put deinterleave+FFT+GCC into `FFT_Task`, USB framing into `USB_Task`;
+  have the SAI master-block callback `xTaskNotifyFromISR(fft_task, ...)`; delete the
+  dead superloop. See `freertos_cubemx_config.md` §6.
+
+### BUG-06 — Generated task stacks too small for the DSP pipeline
+
+- **Where:** `.ioc` `FREERTOS.Tasks01` / `Src/freertos.c` — FFT_Task stack = **128
+  words (512 B)**.
+- **Symptom (predicted):** stack overflow once FFT_Task runs the FFT/GCC pipeline +
+  `printf` (caught by `configCHECK_FOR_STACK_OVERFLOW=2` if lucky, else a HardFault).
+- **Root cause:** CubeMX defaulted every task to 128 words. The big DSP buffers are
+  DTCM globals (not on the stack), but the call depth + printf still needs more.
+- **Fix:** raise FFT_Task stack to >= 2048 words (USB/DOA 512, Monitor 256), per the
+  TASK-09 table. Also `result_queue` is a placeholder (`uint16_t` x16) and must match
+  the TDOA item type.
+
+### BUG-05 — `result_queue` item type can't hold the TDOA vector
+
+- **Where:** `Src/main.c` `osMessageQueueNew(16, sizeof(uint16_t), ...)` (~line 303);
+  `.ioc` `FREERTOS.Queues01=result_queue,16,uint16_t,...`.
+- **Symptom (predicted):** FFT_Task can't pass `g_tdoa_lag[7]` (int32 lags) to DOA_Task
+  through the queue — the item is a single `uint16_t`.
+- **Root cause:** placeholder type picked in CubeMX. The breakdown intends the queue to
+  carry the per-pair TDOA result.
+- **Fix:** make the queue item a struct/array sized for the TDOA result (e.g.
+  `int32_t lags[GCC_NPAIRS_LIVE]`, or the full 8x8 matrix the breakdown's DOA_Task
+  expects), and create the queue with that `sizeof`.
+
+### BUG-04b — DWT cycle counter + Audio_Start stranded in the dead superloop
+
+- **Where:** `Src/main.c` — `Clock_Verify()` (arms `DWT->CYCCNT`) and `Audio_Start()`
+  are in the post-`osKernelStart()` dead code (BUG-07).
+- **Symptom (predicted):** even after moving the pipeline into tasks, if these two are
+  forgotten: (a) **no mic data at all** (DMA never armed by `Audio_Start`), and (b) the
+  FFT/GCC timing prints (`g_fft_us`, `g_gcc_us`) read garbage because `DWT->CYCCNT` was
+  never enabled (`Clock_Verify` sets `TRCENA` + `CYCCNTENA`).
+- **Fix:** arm the DWT counter and call `Audio_Start()` during RTOS init (e.g. top of
+  FFT_Task before its loop, or in a one-time init), not in the abandoned superloop.
+
+### BUG-03b — `MX_USB_DEVICE_Init()` now runs inside `StartDefaultTask`
+
+- **Where:** `Src/main.c` `StartDefaultTask` (~line 1163) — CubeMX moved USB init out of
+  `main()` into the default task.
+- **Symptom (predicted):** USB device is only initialized once the scheduler runs and
+  the default task executes; any USB access from another task before that (or from the
+  old superloop's `hUsbDeviceHS` use) finds it uninitialized.
+- **Root cause:** with FreeRTOS + USB middleware, CubeMX defers `MX_USB_DEVICE_Init()`
+  to the default task. Not a bug per se, but a sequencing change to account for.
+- **Fix:** when writing USB_Task, gate transmits on the device being ready (the existing
+  `hcdc != NULL && TxState == 0` guard already covers the not-yet-ready case); don't
+  assume USB is up at `main()` time.
+
+### Note (not a bug) — CubeMX did NOT restructure to `Core/`
+
+This project keeps the flat `Src/` + `Inc/` layout (no `Core/Src`, `Core/Inc`).
+The regenerate edited files in place and preserved all USER CODE blocks, so the
+TASK-07/08 code in `Src/main.c` USER CODE 4 survived intact. The linker `KEEP()`
+sections (`.DTCMSection`/`.DMASection`/`.USBSection`) and 1 MB AXI SRAM region also
+survived. (CLI builds still need `Debug/` regenerated with the new FreeRTOS sources
+**and** the CMSIS-DSP wiring re-applied — see BUG note in the TASK-07 build section.)
+
+---
+
 ## 2026-06-01 — USB CDC test tooling (TASK-06 verification)
 
 ### BUG-04 — MATLAB `hann()` needs the Signal Processing Toolbox
