@@ -1,0 +1,17 @@
+# --- STM32CubeIDE build output ---
+STM32CubeIDE/Debug/
+STM32CubeIDE/Release/
+*.o
+*.d
+*.su
+*.cyclo
+*.map
+*.elf
+*.list
+*.bin
+*.hex
+
+# --- OS / editor ---
+Thumbs.db
+.DS_Store
+*.swp

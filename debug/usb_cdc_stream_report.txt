@@ -1,0 +1,27 @@
+USB CDC raw stream check
+Generated: 2026-06-01 00:23:26
+
+TASK-06 USB CDC Raw Stream Check
+Using OTG CDC port: COM12
+Expecting frames: magic=RAW1 nch=8 nsamp=1024 fmt=0 (32780 bytes each)
+Need 10 valid frame(s) within 20 s.
+
+Captured 459432 bytes from COM12
+
+frame 1: seq=487  ch0[0..32767] ch1[0..32767] ch2[0..32767] ch3[0..32767] ch4[0..32767] ch5[0..32767] ch6[0..32767] ch7[0..32767]
+frame 2: seq=488  ch0[0..32767] ch1[0..32767] ch2[0..32767] ch3[0..32767] ch4[0..32767] ch5[0..32767] ch6[0..32767] ch7[0..32767]
+frame 3: seq=489  ch0[0..32767] ch1[0..32767] ch2[0..32767] ch3[0..32767] ch4[0..32767] ch5[0..32767] ch6[0..32767] ch7[0..32767]
+frame 4: seq=490  ch0[0..32767] ch1[0..32767] ch2[0..32767] ch3[0..32767] ch4[0..32767] ch5[0..32767] ch6[0..32767] ch7[0..32767]
+frame 5: seq=491  ch0[0..32767] ch1[0..32767] ch2[0..32767] ch3[0..32767] ch4[0..32767] ch5[0..32767] ch6[0..32767] ch7[0..32767]
+frame 6: seq=492  ch0[0..32767] ch1[0..32767] ch2[0..32767] ch3[0..32767] ch4[0..32767] ch5[0..32767] ch6[0..32767] ch7[0..32767]
+frame 7: seq=493  ch0[0..32767] ch1[0..32767] ch2[0..32767] ch3[0..32767] ch4[0..32767] ch5[0..32767] ch6[0..32767] ch7[0..32767]
+frame 8: seq=494  ch0[0..32767] ch1[0..32767] ch2[0..32767] ch3[0..32767] ch4[0..32767] ch5[0..32767] ch6[0..32767] ch7[0..32767]
+frame 9: seq=495  ch0[0..32767] ch1[0..32767] ch2[0..32767] ch3[0..32767] ch4[0..32767] ch5[0..32767] ch6[0..32767] ch7[0..32767]
+frame 10: seq=496  ch0[0..32767] ch1[0..32767] ch2[0..32767] ch3[0..32767] ch4[0..32767] ch5[0..32767] ch6[0..32767] ch7[0..32767]
+
+[ OK ] Received 10 valid RAW1 frame(s)
+[ OK ] Headers valid (nch=8 nsamp=1024 fmt=0)
+[ OK ] Sequence counter advanced
+[ OK ] All samples within 24-bit range
+USB CDC raw stream check passed.
+Report written to: C:\Users\huybu\OneDrive\Máy tính\code_TN\debug\usb_cdc_stream_report.txt

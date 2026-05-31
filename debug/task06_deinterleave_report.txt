@@ -1,0 +1,84 @@
+TASK-06 deinterleave report
+Generated: 2026-06-01 00:08:58
+
+TASK-06 Deinterleave Verify
+ELF : C:\Users\huybu\OneDrive\Máy tính\code_TN\STM32CubeIDE\Debug\code_ver2_Fs16khz.elf
+Port: COM3 @ 115200 (ST-Link VCP heartbeat; raw mic data streams on the OTG CDC port)
+
+Flashing firmware and resetting...
+      -------------------------------------------------------------------
+                       STM32CubeProgrammer v2.22.0                  
+      -------------------------------------------------------------------
+
+ST-LINK SN  : 003500503132510838363431
+ST-LINK FW  : V3J17M10
+Board       : NUCLEO-H7A3ZI-Q
+Voltage     : 3.29V
+SWD freq    : 8000 KHz
+Connect mode: Under Reset
+Reset mode  : Hardware reset
+Device ID   : 0x480
+Revision ID : Rev X
+Device name : STM32H7A/B
+NVM size  : 2 MBytes
+Device type : MCU
+Device CPU  : Cortex-M7
+BL Version  : 0x92
+
+
+
+Opening and parsing file: code_ver2_Fs16khz.elf
+
+
+Memory Programming ...
+  File          : code_ver2_Fs16khz.elf
+  Size          : 71.11 KB 
+  Address       : 0x08000000
+
+
+Erasing memory corresponding to segment 0:
+Erasing internal memory sectors [0 8]
+Download in Progress:
+?????????????????????????????????????????????????? 0%
+?????????????????????????????????????????????????? 100%
+
+File download complete
+Time elapsed during download operation: 00:00:00.283
+
+MCU Reset
+
+Software reset is performed
+
+Reading COM3 for up to 20 s (need >=2 heartbeats)...
+
+----- VCP output -----
+--- TASK-03 Clock Verify ---
+SYSCLK : 64000000 Hz
+HCLK   : 64000000 Hz
+PCLK1  : 64000000 Hz
+Clock OK. DWT cycle counter enabled.
+--- TASK-04 SAI + DMA Verify ---
+SAI1_A(mst) state=READY data=24b slot=32b nslot=2 frame=64 dma=circ/word/noFIFO
+SAI1_B(slv) state=READY data=24b slot=32b nslot=2 frame=64 dma=circ/word/noFIFO
+SAI2_A(slv) state=READY data=24b slot=32b nslot=2 frame=64 dma=circ/word/noFIFO
+SAI2_B(slv) state=READY data=24b slot=32b nslot=2 frame=64 dma=circ/word/noFIFO
+SAI READY: 4/4   DMA configured: 4/4
+TASK-04 OK: SAI+DMA init, no HAL_ERROR.
+--- TASK-05 DMA Ping-Pong ---
+pair0: half=8 full=7
+pair1: half=8 full=7
+pair2: half=8 full=7
+pair3: half=8 full=7
+TASK-05 OK: all 4 DMA streams ping-ponging.
+--- TASK-06 Deinterleave + raw USB CDC stream ---
+blk=16 mic0[min=0 max=32767] usb_seq=1 overruns=0
+blk=32 mic0[min=0 max=32767] usb_seq=1 overruns=0
+----------------------
+
+[ OK ] TASK-06 banner present
+[ OK ] Deinterleave loop running (blk 16 -> 32)
+[ OK ] No DMA overruns
+
+TASK-06 deinterleave check passed.
+Raw mic data streams on the OTG USB CDC port - verify in MATLAB with tools\read_mic_raw.m
+Report written to: C:\Users\huybu\OneDrive\Máy tính\code_TN\debug\task06_deinterleave_report.txt
