@@ -639,8 +639,14 @@ Wiring (CLI makefile build):
   define needed**. `arm_sin_f32` was avoided (would pull in `FastMathFunctions`); the self-test uses
   libm `sinf` instead.
 
-> If STM32CubeIDE regenerates the build, re-add the `-include` line, the five `objects.list` entries,
-> and `Drivers/CMSIS/DSP/subdir.mk`.
+> The five DSP aggregate units are now registered as **linked source files** in the project model
+> (`STM32CubeIDE/.project`), and a per-folder `Drivers/CMSIS/DSP` override in `STM32CubeIDE/.cproject`
+> forces them to `-O2` (Debug default is `-O0`) while carrying the full include paths + defines. So
+> STM32CubeIDE (GUI or headless) now regenerates `Debug/Drivers/CMSIS/DSP/subdir.mk` and links the DSP
+> objects automatically — no manual `subdir.mk` / `objects.list` / `makefile` editing is needed anymore.
+> (Verified via headless `org.eclipse.cdt.managedbuilder.core.headlessbuild -cleanBuild`: 0 errors,
+> ELF text=179356.) `DSP/PrivateInclude` was added to the C-compiler include paths for both Debug and
+> Release because some component `.c` files pulled in by the aggregates need it.
 
 ### What Was Added (`Src/main.c`, guarded by `FFT_ENABLE`)
 
