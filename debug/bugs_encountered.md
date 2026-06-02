@@ -5,6 +5,35 @@ symptom → root cause → fix. Newest first. Append new entries as they come up
 
 ---
 
+## 2026-06-01 — TASK-11 DOA
+
+### BUG-12 — defaultTask stack overflow zeroed the result_queue control block (DOA IPC dead since TASK-09)
+
+- **Where:** `Src/main.c`, `defaultTask_attributes.stack_size` (was `128 * 4`) and the
+  `FFT_Task -> result_queue -> DOA_Task` IPC path.
+- **Symptom:** TASK-11's DOA **self-test printed OK**, but **no live `DOA seq=` lines** ever
+  appeared. The same was silently true back in TASK-09 (its `vTaskList` showed `DOA_Task` blocked
+  and its report has zero DOA lines — the check just never asserted them).
+- **Diagnosis:** Instrumented the queue with VCP counters → `puts=0 putfail=ALL gets=0`, every
+  `osMessageQueuePut` returning `osErrorResource` (−3, "queue full") while `DOA_Task` stayed
+  blocked on an apparently empty queue. `osMessageQueueGetCapacity` reported **0**. An ST-LINK read
+  of the queue control block (`-r32 <handle>`) showed the **storage pointers still sized for 4×32**
+  (pcTail = pcHead + 128) but `uxLength`/`uxItemSize` **zeroed** → created correctly, then corrupted.
+- **Root cause:** `defaultTask` had only **128 words** of stack but runs `MX_USB_DEVICE_Init()`
+  (stack-hungry). It overflowed (TASK-09's `vTaskList` literally showed `defaultTask` stack-free
+  = **0**) and wrote **down past its stack into the FreeRTOS heap**, hitting the `result_queue`
+  control block — the *first* heap allocation, sitting at the very start of `ucHeap` — and zeroing
+  `uxLength`/`uxItemSize`. With `uxLength = 0` every send sees a "full" queue and every receive
+  blocks forever.
+- **Fix:** raise `defaultTask` stack to **512 words**. After that `cap=4`, every put/get succeeds,
+  and live DOA flows. (General lesson: a task whose `vTaskList` stack-free hits 0 is overflowing;
+  on this project it corrupts the heap-resident queue/TCBs, not the task's own data, so the failure
+  shows up far from the cause.)
+- **Note:** the TASK-09 summary claim that "DOA_Task drains result_queue and prints live lag
+  vectors" was therefore never actually exercised end-to-end; TASK-11 is where the IPC first runs.
+
+---
+
 ## 2026-06-01 — CMSIS-DSP build integration into the CubeIDE project model (TASK-07/09)
 
 Hit while rebuilding TASK-09 on a fresh checkout and then making it build from the

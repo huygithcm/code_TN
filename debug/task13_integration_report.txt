@@ -1,0 +1,73 @@
+TASK-13 integration test report
+Generated: 2026-06-01 23:43:40
+
+TASK-13 End-to-End Integration Test
+ELF : C:\Users\huybu\OneDrive\Máy tính\code_TN\STM32CubeIDE\Debug\code_ver2_Fs16khz.elf
+VCP : COM3 @ 115200   soak=60s   usb=60s
+
+Flashing firmware and resetting...
+      -------------------------------------------------------------------
+                       STM32CubeProgrammer v2.22.0                  
+      -------------------------------------------------------------------
+
+ST-LINK SN  : 003500503132510838363431
+ST-LINK FW  : V3J17M10
+Board       : NUCLEO-H7A3ZI-Q
+Voltage     : 3.29V
+SWD freq    : 8000 KHz
+Connect mode: Under Reset
+Reset mode  : Hardware reset
+Device ID   : 0x480
+Revision ID : Rev X
+Device name : STM32H7A/B
+NVM size  : 2 MBytes
+Device type : MCU
+Device CPU  : Cortex-M7
+BL Version  : 0x92
+
+
+
+Opening and parsing file: code_ver2_Fs16khz.elf
+
+
+Memory Programming ...
+  File          : code_ver2_Fs16khz.elf
+  Size          : 180.18 KB 
+  Address       : 0x08000000
+
+
+Erasing memory corresponding to segment 0:
+Erasing internal memory sectors [0 22]
+Download in Progress:
+?????????????????????????????????????????????????? 0%
+?????????????????????????????????????????????????? 100%
+
+File download complete
+Time elapsed during download operation: 00:00:00.635
+
+MCU Reset
+
+Software reset is performed
+Reading COM3 for 68s (boot self-tests + IT-06 soak)...
+
+Running IT-04 USB continuity (60s) via check_task10_usb_cdc.ps1...
+
+================ TASK-13 Integration Matrix ================
+boot reset-cause : PIN
+stack high-water : def=344 fft=1874 usb=463 doa=358 mon=365 -> all >10%
+------------------------------------------------------------
+IT-01 Tone bin (1kHz->bin64)           : PASS (bin 64)
+IT-02 Silence (zero-in->zero-out)      : PASS
+IT-03 TDOA synthetic (delay5->lag5)    : PASS (lag 5)
+IT-06 Overrun soak (60s)               : PASS (blocks 24->1081, overruns=0, saiErr=0, no reset)
+IT-04 USB continuity (60s)             : PASS
+IT-05 DOA sweep (speaker angles)       : MANUAL (solver self-test PASS; acoustic sweep is manual)
+IT-07 Watchdog (stall->reset)          : MANUAL (demonstrated in TASK-12; destructive)
+============================================================
+
+IT-05/IT-07 are manual: move a source around the array and watch az/el on
+COM3 (IT-05); IT-07 watchdog reset is demonstrated in TASK-12 (stall the
+pipeline -> 'last reset: IWDG' on the next boot).
+
+TASK-13 integration test passed (all automated IT checks).
+Report written to: C:\Users\huybu\OneDrive\Máy tính\code_TN\debug\task13_integration_report.txt

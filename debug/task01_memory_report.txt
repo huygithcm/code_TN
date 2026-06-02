@@ -1,66 +1,10 @@
 TASK-01 memory debug report
-Generated: 2026-06-01 00:07:28
+Generated: 2026-06-01 22:01:42
 
 Checking Task-01 memory map:
 Map: C:\Users\huybu\OneDrive\Máy tính\code_TN\STM32CubeIDE\Debug\code_ver2_Fs16khz.map
-[ OK ] dma_buf = 0x2400A400
+[ OK ] dma_buf = 0x240133E0
 [ OK ] mic_data = 0x20000000
-
-Using STM32 Programmer CLI: C:\ST\STM32CubeIDE_2.1.1\STM32CubeIDE\plugins\com.st.stm32cube.ide.mcu.externaltools.cubeprogrammer.win32_2.2.400.202601091506\tools\bin\STM32_Programmer_CLI.exe
-
-ST-LINK read: dma_buf at 0x2400A400, 32 bytes
-      -------------------------------------------------------------------
-                       STM32CubeProgrammer v2.22.0                  
-      -------------------------------------------------------------------
-
-ST-LINK SN  : 003500503132510838363431
-ST-LINK FW  : V3J17M10
-Board       : NUCLEO-H7A3ZI-Q
-Voltage     : 3.29V
-SWD freq    : 8000 KHz
-Connect mode: Under Reset
-Reset mode  : Hardware reset
-Device ID   : 0x480
-Revision ID : Rev X
-Device name : STM32H7A/B
-NVM size  : 2 MBytes
-Device type : MCU
-Device CPU  : Cortex-M7
-BL Version  : 0x92
-
-
-Reading 32-bit memory content
-  Size          : 32 Bytes
-  Address:      : 0x2400A400
-0x2400A400 : 007FE9CA 007FDD49 007FEAC1 007FDC4D
-0x2400A410 : 007FE075 007FE4F1 007FE4F0 007FE00D
-
-ST-LINK read: mic_data at 0x20000000, 32 bytes
-      -------------------------------------------------------------------
-                       STM32CubeProgrammer v2.22.0                  
-      -------------------------------------------------------------------
-
-ST-LINK SN  : 003500503132510838363431
-ST-LINK FW  : V3J17M10
-Board       : NUCLEO-H7A3ZI-Q
-Voltage     : 3.29V
-SWD freq    : 8000 KHz
-Connect mode: Under Reset
-Reset mode  : Hardware reset
-Device ID   : 0x480
-Revision ID : Rev X
-Device name : STM32H7A/B
-NVM size  : 2 MBytes
-Device type : MCU
-Device CPU  : Cortex-M7
-BL Version  : 0x92
-
-
-Reading 32-bit memory content
-  Size          : 32 Bytes
-  Address:      : 0x20000000
-0x20000000 : 3B7FD200 3B7FD400 3B7FC000 3B7FC800
-0x20000010 : 3B7FD000 3B7FE200 3B7FF400 3B7FDC00
 
 Task-01 memory map check passed.
 Report written to: C:\Users\huybu\OneDrive\Máy tính\code_TN\debug\task01_memory_report.txt
