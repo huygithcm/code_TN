@@ -73,6 +73,19 @@
 #define GCC_SELFTEST_SHIFT   5                            /* synthetic delay -> lag 5   */
 #define GCC_NPAIRS_LIVE      (NUM_MIC_CHANNELS - 1U)      /* live demo: mic0 vs mic1..7 */
 
+/* TASK-11: direction of arrival from the live mic0-vs-mic1..7 TDOAs. Planar (2D)
+ * array, far-field plane-wave least-squares -> azimuth (+ elevation magnitude).
+ * EDIT mic_pos[][] (near DOA_Init) to match the physical array. Current layout:
+ * a 2x4 grid of the 4 stereo pairs - each pair is a column of 2 mics
+ * MIC_INPAIR_SPACING_M apart (y); the 4 columns are MIC_PAIR_SPACING_M apart (x).
+ * Channel index = pair*2 + side, side 0 = L, side 1 = R (matches the SAI mapping). */
+#define DOA_ENABLE           1
+#define C_SOUND_MPS          343.0f                       /* speed of sound @ 20 C      */
+#define MIC_PAIR_SPACING_M   0.01937f                     /* 19.37 mm between pairs (x) */
+#define MIC_INPAIR_SPACING_M 0.02710f                     /* 27.1 mm within a pair (y)  */
+#define DOA_NPAIRS           GCC_NPAIRS_LIVE              /* 7 baselines: mic0 vs 1..7  */
+#define DOA_SELFTEST_AZ      30.0f                        /* synthetic source azimuth   */
+
 /* TASK-09: FreeRTOS task notification flags (FFT_Task waits on these). */
 #define FLAG_FFT             (1UL << 0)                   /* a fresh half is ready      */
 #define FLAG_USB             (1UL << 1)                   /* build+send a USB raw frame */
@@ -81,8 +94,8 @@
  * produces, handed to DOA_Task. seq lets DOA_Task spot dropped results. */
 typedef struct
 {
-  uint32_t seq;                       /* processed-block counter            */
-  int32_t  lag[GCC_NPAIRS_LIVE];      /* mic0 vs mic1..7, samples           */
+  uint32_t seq;                       /* processed-block counter                  */
+  float    lag[GCC_NPAIRS_LIVE];      /* mic0 vs mic1..7, fractional samples (TASK-11) */
 } tdoa_result_t;
 /* USER CODE END PD */
 
@@ -106,9 +119,15 @@ DMA_HandleTypeDef hdma_sai2_b;
 
 /* Definitions for defaultTask */
 osThreadId_t defaultTaskHandle;
+/* TASK-11 (BUG): defaultTask runs MX_USB_DEVICE_Init(), which is stack-hungry. The
+ * CubeMX default of 128 words overflowed (vTaskList showed 0 words free) and wrote
+ * down into the FreeRTOS heap, zeroing the result_queue control block (uxLength /
+ * uxItemSize -> 0) since that queue is the first heap allocation. That silently
+ * broke the FFT_Task->DOA_Task IPC (every osMessageQueuePut returned osErrorResource,
+ * DOA_Task blocked forever) from TASK-09 on. 512 words gives USB init headroom. */
 const osThreadAttr_t defaultTask_attributes = {
   .name = "defaultTask",
-  .stack_size = 128 * 4,
+  .stack_size = 512 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
 /* Definitions for FFT_Task */
@@ -170,7 +189,8 @@ volatile uint32_t dma_full_cnt[NUM_SAI_BLOCKS];
 volatile uint8_t  g_half_ready;     /* a fresh half is ready to process            */
 volatile uint8_t  g_ready_half;     /* 0 = first half (PING), 1 = second half (PONG)*/
 volatile uint32_t g_overruns;       /* main loop failed to keep up with a half      */
-uint32_t g_usb_seq;                 /* raw frames successfully queued to USB        */
+uint32_t g_usb_seq;                 /* raw frames successfully queued to USB (host seq) */
+volatile uint32_t g_usb_drops;      /* TASK-10: frames dropped because USB was busy  */
 
 #if USB_RAW_STREAM
 /* USB CDC raw streaming frame (header + int32 channel-major payload). */
@@ -207,8 +227,17 @@ float   gcc_r[FFT_SIZE];
 __attribute__((section(".DTCMSection"), aligned(32), used))
 float   gcc_corr[FFT_SIZE];
 
-volatile int32_t  g_tdoa_lag[GCC_NPAIRS_LIVE];  /* mic0 vs mic(k+1), samples */
+volatile int32_t  g_tdoa_lag[GCC_NPAIRS_LIVE];  /* mic0 vs mic(k+1), samples (rounded) */
+float    g_tdoa_lag_f[GCC_NPAIRS_LIVE];          /* TASK-11: fractional lags (sub-sample) */
 volatile uint32_t g_gcc_us;                     /* time to compute the live pairs (us) */
+
+#if DOA_ENABLE
+/* TASK-11 DOA state. g_doa_M = precomputed least-squares pseudo-inverse rows so each
+ * frame is just 2x7 MACs; g_doa_az/el = last estimate (degrees). */
+float    g_doa_M[2][DOA_NPAIRS];
+volatile float g_doa_az;                         /* azimuth, degrees [0,360)   */
+volatile float g_doa_el;                         /* elevation magnitude, [0,90]*/
+#endif
 #endif
 #endif
 
@@ -223,6 +252,8 @@ int32_t  usb_snapshot[NUM_MIC_CHANNELS][AUDIO_BLOCK_SAMPLES];
 volatile uint8_t g_usb_snapshot_valid;
 #endif
 volatile uint32_t g_blocks;                     /* processed-block counter (Monitor)  */
+volatile uint32_t g_sai_errors;                 /* TASK-12: HW SAI errors (HAL_SAI_ErrorCallback) */
+volatile uint32_t g_sai_err_code;               /* TASK-12: last HAL SAI error code    */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -248,11 +279,17 @@ static void Deinterleave_Pair(uint32_t off, uint8_t pair);
 void FFT_Init(void);
 void FFT_ProcessAll(void);
 void FFT_SelfTest(void);
+void Silence_SelfTest(void);
 static uint32_t FFT_PeakBin(const float *mag, float *peakVal);
 #if GCC_ENABLE
 int32_t GCC_PHAT(const float *a, const float *b);
 void GCC_SelfTest(void);
 void GCC_ProcessPairs(void);
+#if DOA_ENABLE
+void DOA_Init(void);
+void DOA_Compute(const float *lag_f, float *az_deg, float *el_deg);
+void DOA_SelfTest(void);
+#endif
 #endif
 #endif
 void Pipeline_InitOnce(void);
@@ -970,6 +1007,35 @@ void FFT_SelfTest(void)
   }
 }
 
+/**
+  * @brief  TASK-13 IT-02 - silence self-test: push a zero (silent) frame through
+  *         the FFT path and confirm a ~zero spectrum (no DC bias, no fabricated
+  *         tone, no NaN). True acoustic silence is unreachable on the live mics
+  *         (~50 Hz mains hum), so this validates IT-02's intent deterministically.
+  */
+void Silence_SelfTest(void)
+{
+  for (uint32_t i = 0U; i < FFT_SIZE; i++) { fft_win[i] = 0.0f; }
+  arm_rfft_fast_f32(&fft_inst, fft_win, fft_cplx, 0U);
+  arm_cmplx_mag_f32(fft_cplx, fft_mag[0], FFT_BINS);
+
+  float    mx;
+  uint32_t ix;
+  arm_max_f32(fft_mag[0], FFT_BINS, &mx, &ix);
+
+  printf("\r\n--- TASK-13 IT-02 silence ---\r\n");
+  printf("silence self-test: peak mag=%ld (expect ~0)\r\n", (long)mx);
+  if (mx < 1.0f)
+  {
+    printf("IT-02 silence self-test OK (zero-in -> zero-out).\r\n");
+  }
+  else
+  {
+    printf("IT-02 silence self-test FAIL.\r\n");
+    BSP_LED_On(LED_RED);
+  }
+}
+
 #if GCC_ENABLE
 /**
   * @brief  TASK-08 - GCC-PHAT time-delay estimate between two real signals.
@@ -981,6 +1047,8 @@ void FFT_SelfTest(void)
   *  the source spectrum. Note arm_rfft_fast_f32 (forward) overwrites its input, so
   *  we FFT from the fft_win scratch copy, never from the caller's array.
   */
+static float g_last_frac;   /* TASK-11: sub-sample lag from the last GCC_PHAT call */
+
 int32_t GCC_PHAT(const float *a, const float *b)
 {
   memcpy(fft_win, a, sizeof(float) * FFT_SIZE);
@@ -1013,8 +1081,21 @@ int32_t GCC_PHAT(const float *a, const float *b)
   uint32_t maxIdx;
   arm_max_f32(gcc_corr, FFT_SIZE, &maxVal, &maxIdx);
 
+  /* TASK-11: parabolic interpolation around the peak for a sub-sample lag. The
+   * array is tiny (max delay ~2.7 samples), so integer lags are too coarse for a
+   * meaningful angle; fitting a parabola to the 3 points recovers the fraction.
+   * gcc_corr is circular (length FFT_SIZE), so neighbours wrap around. */
+  uint32_t im1 = (maxIdx == 0U) ? (FFT_SIZE - 1U) : (maxIdx - 1U);
+  uint32_t ip1 = (maxIdx + 1U == FFT_SIZE) ? 0U : (maxIdx + 1U);
+  float ym1 = gcc_corr[im1], y0 = gcc_corr[maxIdx], yp1 = gcc_corr[ip1];
+  float denom = ym1 - 2.0f * y0 + yp1;
+  float delta = (fabsf(denom) > 1e-12f) ? (0.5f * (ym1 - yp1) / denom) : 0.0f;
+  if (delta > 1.0f)  { delta = 1.0f; }
+  if (delta < -1.0f) { delta = -1.0f; }
+
   int32_t lag = (int32_t)maxIdx;
   if (lag > (int32_t)(FFT_SIZE / 2U)) { lag -= (int32_t)FFT_SIZE; }
+  g_last_frac = (float)lag + delta;
   return lag;
 }
 
@@ -1064,12 +1145,191 @@ void GCC_ProcessPairs(void)
   uint32_t t0 = DWT->CYCCNT;
   for (uint32_t k = 0U; k < GCC_NPAIRS_LIVE; k++)
   {
-    g_tdoa_lag[k] = GCC_PHAT(mic_data[0], mic_data[k + 1U]);
+    g_tdoa_lag[k]   = GCC_PHAT(mic_data[0], mic_data[k + 1U]);
+    g_tdoa_lag_f[k] = g_last_frac;       /* TASK-11: sub-sample lag for DOA */
   }
   g_gcc_us = (DWT->CYCCNT - t0) / 64U;   /* cycles @ 64 MHz -> us */
 }
+
+#if DOA_ENABLE
+/* TASK-11: physical mic coordinates in metres, channel-major (ch = pair*2 + side).
+ * >>> EDIT THIS TABLE to match the real array <<<. Default = 2x4 grid: pair p sits
+ * at x = p * MIC_PAIR_SPACING_M; the pair's two mics (L = side 0, R = side 1) at
+ * y = 0 and y = MIC_INPAIR_SPACING_M. The x axis is the pair (column) axis, the y
+ * axis is the in-pair axis. Only differences relative to mic0 matter, so the origin
+ * is arbitrary. Azimuth below is measured in this x-y plane: 0 deg = +x, 90 = +y, CCW. */
+static const float mic_pos[NUM_MIC_CHANNELS][2] = {
+  { 0.0f * MIC_PAIR_SPACING_M, 0.0f                },  /* ch0  pair0 L */
+  { 0.0f * MIC_PAIR_SPACING_M, MIC_INPAIR_SPACING_M },  /* ch1  pair0 R */
+  { 1.0f * MIC_PAIR_SPACING_M, 0.0f                },  /* ch2  pair1 L */
+  { 1.0f * MIC_PAIR_SPACING_M, MIC_INPAIR_SPACING_M },  /* ch3  pair1 R */
+  { 2.0f * MIC_PAIR_SPACING_M, 0.0f                },  /* ch4  pair2 L */
+  { 2.0f * MIC_PAIR_SPACING_M, MIC_INPAIR_SPACING_M },  /* ch5  pair2 R */
+  { 3.0f * MIC_PAIR_SPACING_M, 0.0f                },  /* ch6  pair3 L */
+  { 3.0f * MIC_PAIR_SPACING_M, MIC_INPAIR_SPACING_M },  /* ch7  pair3 R */
+};
+
+/**
+  * @brief  TASK-11 - precompute the least-squares pseudo-inverse for the DOA solve.
+  *         Far-field plane wave: each baseline d_k = pos[k+1]-pos[0] obeys
+  *         d_k . u = -(C/Fs) * lag_k, with u the unit direction to the source. With
+  *         7 baselines and 2 unknowns (planar array), u = (DtD)^-1 Dt b in the
+  *         least-squares sense. We fold the -(C/Fs) scale into M so that, per frame,
+  *         u = M . lag_f is a plain 2x7 dot product.
+  */
+void DOA_Init(void)
+{
+  float D[DOA_NPAIRS][2];
+  for (uint32_t k = 0U; k < DOA_NPAIRS; k++)
+  {
+    D[k][0] = mic_pos[k + 1U][0] - mic_pos[0][0];
+    D[k][1] = mic_pos[k + 1U][1] - mic_pos[0][1];
+  }
+  /* DtD = [[a b],[b c]] */
+  float a = 0.0f, b = 0.0f, c = 0.0f;
+  for (uint32_t k = 0U; k < DOA_NPAIRS; k++)
+  {
+    a += D[k][0] * D[k][0];
+    b += D[k][0] * D[k][1];
+    c += D[k][1] * D[k][1];
+  }
+  float det = a * c - b * b;
+  if (fabsf(det) < 1e-18f) { det = 1e-18f; }      /* guard degenerate geometry */
+  float inv00 = c / det, inv01 = -b / det, inv11 = a / det;
+  float scale = -C_SOUND_MPS / (float)AUDIO_FS_HZ;
+  for (uint32_t k = 0U; k < DOA_NPAIRS; k++)
+  {
+    g_doa_M[0][k] = scale * (inv00 * D[k][0] + inv01 * D[k][1]);
+    g_doa_M[1][k] = scale * (inv01 * D[k][0] + inv11 * D[k][1]);
+  }
+}
+
+/**
+  * @brief  TASK-11 - turn the 7 fractional TDOA lags into azimuth + elevation.
+  *         u = M . lag_f gives the in-plane projection of the unit direction; its
+  *         angle is the azimuth and its magnitude is sin(zenith) = cos(elevation),
+  *         so |u|=1 -> source in the array plane, |u|=0 -> overhead. A planar array
+  *         cannot tell above from below the plane, so elevation is a magnitude.
+  */
+void DOA_Compute(const float *lag_f, float *az_deg, float *el_deg)
+{
+  float sx = 0.0f, sy = 0.0f;
+  for (uint32_t k = 0U; k < DOA_NPAIRS; k++)
+  {
+    sx += g_doa_M[0][k] * lag_f[k];
+    sy += g_doa_M[1][k] * lag_f[k];
+  }
+  float az = atan2f(sy, sx) * (180.0f / PI_F);
+  if (az < 0.0f) { az += 360.0f; }
+  float smag = sqrtf(sx * sx + sy * sy);
+  if (smag > 1.0f) { smag = 1.0f; }               /* noise can push |u| past 1 */
+  *az_deg = az;
+  *el_deg = acosf(smag) * (180.0f / PI_F);        /* 0 = in-plane, 90 = overhead */
+}
+
+/**
+  * @brief  TASK-11 - geometry/solver self-test, independent of the mics. Synthesize
+  *         the lags an in-plane source at DOA_SELFTEST_AZ would produce, then check
+  *         the solver recovers that azimuth (and elevation ~0). Proves the linear
+  *         algebra + mic_pos wiring before trusting live, noisy lags.
+  */
+void DOA_SelfTest(void)
+{
+  float azr = DOA_SELFTEST_AZ * (PI_F / 180.0f);
+  float ux = cosf(azr), uy = sinf(azr);
+  float lag[DOA_NPAIRS];
+  for (uint32_t k = 0U; k < DOA_NPAIRS; k++)
+  {
+    float dx = mic_pos[k + 1U][0] - mic_pos[0][0];
+    float dy = mic_pos[k + 1U][1] - mic_pos[0][1];
+    lag[k] = -((float)AUDIO_FS_HZ / C_SOUND_MPS) * (dx * ux + dy * uy);
+  }
+  float az, el;
+  DOA_Compute(lag, &az, &el);
+  int32_t azi = (int32_t)lroundf(az);
+  int32_t eli = (int32_t)lroundf(el);
+
+  printf("\r\n--- TASK-11 DOA ---\r\n");
+  printf("self-test: az %d -> az %ld el %ld (expected az %d el 0)\r\n",
+         (int)DOA_SELFTEST_AZ, (long)azi, (long)eli, (int)DOA_SELFTEST_AZ);
+  int32_t derr = azi - (int32_t)DOA_SELFTEST_AZ;
+  if (derr < 0) { derr = -derr; }
+  if ((derr <= 2) && (eli <= 2))
+  {
+    printf("TASK-11 self-test OK (azimuth within +/-2 deg).\r\n");
+  }
+  else
+  {
+    printf("TASK-11 self-test FAIL (azimuth off).\r\n");
+    BSP_LED_On(LED_RED);
+  }
+}
+#endif /* DOA_ENABLE */
 #endif /* GCC_ENABLE */
 #endif /* FFT_ENABLE */
+
+/* ===================== TASK-12: Monitor & Watchdog ====================== */
+#define WDG_ENABLE   1
+
+/**
+  * @brief  TASK-12 - HAL SAI error callback. Fires from the SAI IRQ (SAI1 and,
+  *         after this task, SAI2) or the DMA error path on overrun/FIFO errors.
+  *         We only count + flag here; the circular DMA keeps running.
+  */
+void HAL_SAI_ErrorCallback(SAI_HandleTypeDef *hsai)
+{
+  g_sai_errors++;
+  g_sai_err_code = HAL_SAI_GetError(hsai);
+  BSP_LED_On(LED_RED);
+}
+
+/**
+  * @brief  TASK-12 - start the independent watchdog (IWDG1) directly via registers
+  *         (the HAL IWDG module is disabled in this project, and register access is
+  *         regen-safe). LSI ~32 kHz, prescaler /64 -> 2 ms/tick, reload 1000 ->
+  *         ~2.0 s timeout. Frozen while the debugger halts the core.
+  */
+static void Watchdog_Start(void)
+{
+#if WDG_ENABLE
+  RCC->CSR |= RCC_CSR_LSION;                       /* ensure the IWDG clock (LSI) runs */
+  while ((RCC->CSR & RCC_CSR_LSIRDY) == 0U) { }
+
+  __HAL_DBGMCU_FREEZE_IWDG1();                      /* pause IWDG when halted by debugger */
+
+  IWDG1->KR  = 0x0000CCCCU;                         /* enable IWDG (starts the counter)  */
+  IWDG1->KR  = 0x00005555U;                         /* enable write access to PR/RLR     */
+  IWDG1->PR  = 4U;                                  /* prescaler /64 -> 2 ms/tick        */
+  IWDG1->RLR = 1000U;                               /* reload -> ~2.0 s timeout          */
+  while (IWDG1->SR != 0U) { }                       /* wait for PR/RLR to apply          */
+  IWDG1->KR  = 0x0000AAAAU;                         /* first reload (feed)               */
+#endif
+}
+
+static inline void Watchdog_Refresh(void)
+{
+#if WDG_ENABLE
+  IWDG1->KR = 0x0000AAAAU;
+#endif
+}
+
+/**
+  * @brief  TASK-12 - report what caused the last reset (so an IWDG-triggered reset
+  *         is visible on the next boot), then clear the flags.
+  */
+static void Print_ResetCause(void)
+{
+  uint32_t rsr = RCC->RSR;
+  printf("\r\n--- TASK-12 Monitor/Watchdog ---\r\n");
+  printf("last reset:");
+  if (rsr & RCC_RSR_IWDG1RSTF) { printf(" IWDG"); }
+  if (rsr & RCC_RSR_PINRSTF)   { printf(" PIN"); }
+  if (rsr & RCC_RSR_BORRSTF)   { printf(" BOR"); }
+  if (rsr & RCC_RSR_SFTRSTF)   { printf(" SFT"); }
+  if (rsr & RCC_RSR_PORRSTF)   { printf(" POR"); }
+  printf("\r\n");
+  __HAL_RCC_CLEAR_RESET_FLAGS();
+}
 
 /**
   * @brief  TASK-09 - one-time pipeline bring-up, run from FFT_Task before its loop.
@@ -1080,13 +1340,19 @@ void GCC_ProcessPairs(void)
 void Pipeline_InitOnce(void)
 {
   Clock_Verify();      /* TASK-03: prints clocks + arms DWT->CYCCNT (FFT/GCC timing) */
+  Print_ResetCause();  /* TASK-12: show + clear the last reset cause (IWDG visible)  */
   SAI_Verify();        /* TASK-04: all 4 SAI blocks READY */
 
 #if FFT_ENABLE
   FFT_Init();          /* TASK-07: Hann window + rfft instance */
-  FFT_SelfTest();      /* TASK-07: 1 kHz -> bin 64 */
+  FFT_SelfTest();      /* TASK-07 / IT-01: 1 kHz -> bin 64 */
+  Silence_SelfTest();  /* TASK-13 IT-02: zero-in -> zero-out */
 #if GCC_ENABLE
   GCC_SelfTest();      /* TASK-08: synthetic 5-sample delay -> lag 5 */
+#if DOA_ENABLE
+  DOA_Init();          /* TASK-11: precompute the least-squares pseudo-inverse */
+  DOA_SelfTest();      /* TASK-11: synthetic azimuth -> recovered azimuth */
+#endif
 #endif
 #endif
 
@@ -1152,7 +1418,7 @@ void StartTask02(void *argument)
     /* Hand the TDOA result to DOA_Task (drop if the queue is full). */
     tdoa_result_t res;
     res.seq = g_blocks;
-    for (uint32_t k = 0U; k < GCC_NPAIRS_LIVE; k++) { res.lag[k] = g_tdoa_lag[k]; }
+    for (uint32_t k = 0U; k < GCC_NPAIRS_LIVE; k++) { res.lag[k] = g_tdoa_lag_f[k]; }
     osMessageQueuePut(result_queueHandle, &res, 0U, 0U);
 #endif
 #endif
@@ -1190,7 +1456,12 @@ void StartTask03(void *argument)
     if (xTaskNotifyWait(0U, FLAG_USB, &flags, portMAX_DELAY) != pdTRUE) { continue; }
     if (!g_usb_snapshot_valid) { continue; }
 
-    /* Only send when the previous CDC transfer finished, else drop this frame. */
+    /* Only send when the previous CDC transfer finished, else drop this frame.
+     * TASK-10: the host-visible seq increments only on a successful send, so the
+     * PC sees a gap-free sequence (a gap there means a TRANSPORT loss). Frames the
+     * device cannot ship because USB is still busy are counted in g_usb_drops -
+     * an expected, by-design back-pressure drop, reported on the [USB] line. */
+    uint8_t sent = 0U;
     USBD_CDC_HandleTypeDef *hcdc = (USBD_CDC_HandleTypeDef *)hUsbDeviceHS.pClassData;
     if ((hcdc != NULL) && (hcdc->TxState == 0U))
     {
@@ -1205,8 +1476,10 @@ void StartTask03(void *argument)
       if (CDC_Transmit_HS(usb_tx_frame, (uint16_t)USB_FRAME_LEN) == USBD_OK)
       {
         g_usb_seq++;
+        sent = 1U;
       }
     }
+    if (!sent) { g_usb_drops++; }
     g_usb_snapshot_valid = 0U;   /* free the snapshot for the next frame */
   }
 #else
@@ -1225,23 +1498,45 @@ void StartTask03(void *argument)
 void StartTask04(void *argument)
 {
   /* USER CODE BEGIN StartTask04 */
-  /* TASK-09: drain the TDOA result queue. TASK-11 will turn lags into an angle;
-   * for now print one result per second as a liveness/IPC check. */
+  /* TASK-11: drain the TDOA result queue, solve direction of arrival, and report
+   * azimuth/elevation (degrees) ~once per second. The LED toggles on each printed
+   * fix so a moving source is visible on the board too. */
   tdoa_result_t res;
   uint32_t last_print = 0U;
   for (;;)
   {
     if (osMessageQueueGet(result_queueHandle, &res, NULL, portMAX_DELAY) != osOK) { continue; }
 
+#if DOA_ENABLE
+    float az, el;
+    DOA_Compute(res.lag, &az, &el);
+    g_doa_az = az;
+    g_doa_el = el;
+
     if ((res.seq - last_print) >= 16U)     /* ~1 Hz at 16 blocks/s */
+    {
+      last_print = res.seq;
+      /* %f is not linked in (newlib-nano, no -u _printf_float); print tenths of a
+       * degree using integer math instead. az in [0,360), el in [0,90]. */
+      int32_t az10 = (int32_t)lroundf(az * 10.0f);
+      int32_t el10 = (int32_t)lroundf(el * 10.0f);
+      printf("DOA seq=%lu az=%ld.%ld el=%ld.%ld\r\n",
+             (unsigned long)res.seq,
+             (long)(az10 / 10), (long)(az10 % 10),
+             (long)(el10 / 10), (long)(el10 % 10));
+      BSP_LED_Toggle(LED_GREEN);
+    }
+#else
+    if ((res.seq - last_print) >= 16U)
     {
       last_print = res.seq;
       printf("DOA seq=%lu lag[", (unsigned long)res.seq);
       for (uint32_t k = 0U; k < GCC_NPAIRS_LIVE; k++)
       {
-        printf("%ld%s", (long)res.lag[k], (k < GCC_NPAIRS_LIVE - 1U) ? " " : "]\r\n");
+        printf("%ld%s", (long)lroundf(res.lag[k]), (k < GCC_NPAIRS_LIVE - 1U) ? " " : "]\r\n");
       }
     }
+#endif
   }
   /* USER CODE END StartTask04 */
 }
@@ -1256,9 +1551,9 @@ void StartTask04(void *argument)
 void StartTask05(void *argument)
 {
   /* USER CODE BEGIN StartTask05 */
-  /* TASK-09: liveness + IPC proof. Print the FreeRTOS task list once (the
-   * "Done when" for TASK-09), then a periodic health line. TASK-12 adds the IWDG
-   * refresh and stack high-water reporting here. */
+  /* TASK-09: liveness + IPC proof (vTaskList once). TASK-12: start the IWDG and
+   * feed it from here, but ONLY while the capture pipeline keeps advancing, plus a
+   * periodic health line (overruns, SAI errors, stack high-water). */
   static char task_list[480];
 
   osDelay(1500);   /* let the pipeline self-tests finish printing first */
@@ -1267,13 +1562,35 @@ void StartTask05(void *argument)
   printf("\r\n--- TASK-09 vTaskList ---\r\n");
   printf("Name          State Prio Stack Num\r\n%s\r\n", task_list);
 
+  /* TASK-12: arm the watchdog now that init is done. We feed it every loop only if
+   * g_blocks changed, so a hung/stalled DSP pipeline lets the IWDG reset the MCU. */
+  uint32_t last_blocks = g_blocks;
+  Watchdog_Start();
+  uint32_t tick = 0U;
+
   for (;;)
   {
-    printf("[MON] blocks=%lu overruns=%lu fft=%luus gcc=%luus heapFree=%u\r\n",
-           (unsigned long)g_blocks, (unsigned long)g_overruns,
-           (unsigned long)g_fft_us, (unsigned long)g_gcc_us,
-           (unsigned)xPortGetFreeHeapSize());
-    osDelay(2000);
+    if (g_blocks != last_blocks) { Watchdog_Refresh(); last_blocks = g_blocks; }
+
+    if ((tick & 3U) == 0U)   /* ~ every 2 s (loop is 500 ms) */
+    {
+      printf("[MON] blocks=%lu overruns=%lu fft=%luus gcc=%luus heapFree=%u saiErr=%lu\r\n",
+             (unsigned long)g_blocks, (unsigned long)g_overruns,
+             (unsigned long)g_fft_us, (unsigned long)g_gcc_us,
+             (unsigned)xPortGetFreeHeapSize(), (unsigned long)g_sai_errors);
+      /* TASK-10: USB CDC transmit health (sent vs back-pressure drops). */
+      printf("[USB] sent=%lu drops=%lu\r\n",
+             (unsigned long)g_usb_seq, (unsigned long)g_usb_drops);
+      /* TASK-12: per-task stack high-water (min free words ever). */
+      printf("[STK] def=%u fft=%u usb=%u doa=%u mon=%u\r\n",
+             (unsigned)uxTaskGetStackHighWaterMark((TaskHandle_t)defaultTaskHandle),
+             (unsigned)uxTaskGetStackHighWaterMark((TaskHandle_t)FFT_TaskHandle),
+             (unsigned)uxTaskGetStackHighWaterMark((TaskHandle_t)USB_TaskHandle),
+             (unsigned)uxTaskGetStackHighWaterMark((TaskHandle_t)DOA_TaskHandle),
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    }
+    tick++;
+    osDelay(500);
   }
   /* USER CODE END StartTask05 */
 }

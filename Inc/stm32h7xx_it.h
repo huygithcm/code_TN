@@ -61,7 +61,7 @@ void TIM6_DAC_IRQHandler(void);
 void OTG_HS_IRQHandler(void);
 void SAI1_IRQHandler(void);
 /* USER CODE BEGIN EFP */
-
+void SAI2_IRQHandler(void);
 /* USER CODE END EFP */
 
 #ifdef __cplusplus

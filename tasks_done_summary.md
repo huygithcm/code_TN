@@ -13,9 +13,9 @@
 | TASK-07 | Hann window and FFT | DONE | Verified on hardware via `scripts/check_task07_fft.ps1`: CMSIS-DSP 1024-pt rfft on all 8 mics; self-test 1 kHz -> peak bin 64; ~9.2 ms/8-mic pass; overruns=0. |
 | TASK-08 | GCC-PHAT and TDOA | DONE | Verified on hardware via `scripts/check_task08_gccphat.ps1`: GCC-PHAT self-test (synthetic 5-sample delay -> lag 5); live mic0-vs-mic1..7 lags computed each heartbeat; overruns=0. |
 | TASK-09 | RTOS tasks and IPC | DONE | Verified on hardware via `scripts/check_task09_rtos.ps1`: FreeRTOS task list shows FFT/USB/DOA/Monitor tasks, notifications/queue run, monitor reports blocks advancing with `overruns=0`. |
-| TASK-10 | USB CDC transmit | TODO | Stream data to the PC over USB CDC. |
-| TASK-11 | DOA output | TODO | Convert TDOA results into direction output. |
-| TASK-12 | Monitor and watchdog | TODO | Add runtime health checks and watchdog handling. |
+| TASK-10 | USB CDC transmit | DONE | Verified on hardware via `scripts/check_task10_usb_cdc.ps1`: 948 RAW1 frames in 60 s (~15.8 fps), seq 1..948 with 0 gaps, samples in 24-bit range. Device-side `g_usb_drops` + `[USB]` monitor line added. |
+| TASK-11 | DOA output | DONE | Verified on hardware via `scripts/check_task11_doa.ps1`: planar least-squares DOA from the 7 sub-sample TDOAs; solver self-test az 30->30; live `DOA seq= az= el=` on COM3 + LED; overruns=0. Fixed a latent bug: defaultTask stack overflow (USB init) was zeroing the result_queue, breaking FFT->DOA IPC since TASK-09. |
+| TASK-12 | Monitor and watchdog | DONE | Verified on hardware via `scripts/check_task12_monitor.ps1`: IWDG (fed only while the pipeline advances), `HAL_SAI_ErrorCallback` + `SAI2_IRQn` enabled (closes TASK-04 follow-up), stack high-water all >10%, 60 s overruns=0/saiErr=0. IT-07 demonstrated: stalling the pipeline triggers an IWDG reset (`last reset: IWDG`). |
 | TASK-13 | Integration test | TODO | End-to-end validation. |
 
 Status meaning:
@@ -639,8 +639,14 @@ Wiring (CLI makefile build):
   define needed**. `arm_sin_f32` was avoided (would pull in `FastMathFunctions`); the self-test uses
   libm `sinf` instead.
 
-> If STM32CubeIDE regenerates the build, re-add the `-include` line, the five `objects.list` entries,
-> and `Drivers/CMSIS/DSP/subdir.mk`.
+> The five DSP aggregate units are now registered as **linked source files** in the project model
+> (`STM32CubeIDE/.project`), and a per-folder `Drivers/CMSIS/DSP` override in `STM32CubeIDE/.cproject`
+> forces them to `-O2` (Debug default is `-O0`) while carrying the full include paths + defines. So
+> STM32CubeIDE (GUI or headless) now regenerates `Debug/Drivers/CMSIS/DSP/subdir.mk` and links the DSP
+> objects automatically — no manual `subdir.mk` / `objects.list` / `makefile` editing is needed anymore.
+> (Verified via headless `org.eclipse.cdt.managedbuilder.core.headlessbuild -cleanBuild`: 0 errors,
+> ELF text=179356.) `DSP/PrivateInclude` was added to the C-compiler include paths for both Debug and
+> Release because some component `.c` files pulled in by the aggregates need it.
 
 ### What Was Added (`Src/main.c`, guarded by `FFT_ENABLE`)
 
@@ -823,3 +829,218 @@ Result:
 [ OK ] Monitor line seen: blocks=24 overruns=0 fft=7691us gcc=25586us heapFree=17136
 TASK-09 RTOS check passed.
 ```
+
+---
+
+## TASK-10 - USB CDC Transmit
+
+**Status:** DONE - verified on hardware.
+
+**Goal:** Stream the 8-channel capture to the PC over USB CDC with no dropped frames;
+"Done when" = the host receives frames with no sequence gap for 60 s.
+
+### What Was Done
+
+The RAW1 CDC stream itself was already built in TASK-06 and moved into `USB_Task` in
+TASK-09 (header `RAW1` + `seq`/`nch`/`nsamp`/`fmt`, then int32 channel-major payload, 32780
+bytes/frame, sent over the OTG USB CDC port via `CDC_Transmit_HS`). TASK-10 closes it out by
+making frame loss **measurable** and adding the sustained 60 s continuity test (replacing the
+breakdown's `pc_verify.py` with a PowerShell check, consistent with the rest of the project).
+
+Firmware (`Src/main.c`):
+
+- The host-visible `g_usb_seq` still increments **only on a successful `CDC_Transmit_HS`**, so the
+  PC sees a gap-free sequence. A gap at the host therefore means a **transport** loss, which is what
+  the 60 s test watches for.
+- Added `volatile uint32_t g_usb_drops` - counts frames the device could **not** ship because the
+  previous CDC transfer was still in flight (`TxState != 0`) or `CDC_Transmit_HS` returned non-OK.
+  These are expected, by-design back-pressure drops (the design explicitly drops rather than blocks).
+- `Monitor_Task` prints a new `[USB] sent=<n> drops=<n>` line each cycle (the `[MON]` line is
+  unchanged, so the TASK-09 check still parses). This makes the device-side drop rate observable.
+
+### Behaviour Observed
+
+While the host is actively draining the port, `sent` advances at ~15.8 fps and `drops` stays low.
+When the host stops reading (port closed), USB `TxState` stays busy, so `sent` freezes and `drops`
+climbs every block - confirming the back-pressure counter is correct (e.g. `[USB] sent=950 drops=706`
+captured right after the test closed COM12).
+
+### Verification - PASSED on hardware
+
+The firmware must already be running - do **not** flash before the check (flashing re-enumerates USB):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/check_task10_usb_cdc.ps1 -DurationSec 60
+```
+
+Options: `-Port COMx` (default: auto-detect VID_0483&PID_5740), `-DurationSec` (default 60),
+`-MinFrames` (default `DurationSec*5`). Report: `debug/task10_usb_cdc_report.txt`. It captures the
+stream fast (4 MB read buffer, capture-then-parse) and walks every frame with the double-magic anchor,
+checking header + strict `seq+1` continuity, plus a 24-bit range spot-check every 100th frame.
+
+```text
+TASK-10 USB CDC Transmit Continuity Check
+Auto-detected OTG CDC port: COM12
+Captured 31106685 bytes (~29.7 MB) from COM12 in ~60 s
+Frames: 948 valid, seq 1..948, ~15.8 fps, gaps=0, range-checked=10 bad=0
+
+[ OK ] Received 948 valid RAW1 frames (~15.8 fps)
+[ OK ] No sequence gaps over 60 s (continuous transport)
+[ OK ] Sampled frames within 24-bit range (10 checked)
+TASK-10 USB CDC continuity check passed.
+```
+
+- **948 frames in 60 s (~15.8 fps)** - matches the ~15.6 Hz half-buffer rate (1024 frames @ 16 kHz).
+- **0 sequence gaps** over the full minute -> the CDC transport is reliable end-to-end.
+- `overruns=0` throughout; adding the drop counter did not perturb the DSP pipeline.
+
+> **Format note:** TASK-10 keeps the existing **RAW1 / int32** frame, not the breakdown's
+> `0x55AA / int16 / CRC16` layout, so the existing host tools (`read_mic_raw.m`, `mic_fft_test.m`,
+> `check_usb_cdc_stream.ps1`) keep working unchanged. int32 also preserves the full 24-bit sample
+> depth (the int16 layout would have truncated 8 bits). CRC integrity is covered instead by the
+> per-frame header/range validation and the strict seq-continuity check.
+
+---
+
+## TASK-11 - DOA Output
+
+**Status:** DONE - verified on hardware.
+
+**Goal:** Turn the live TDOAs into a direction (azimuth + elevation) and output it;
+"Done when" = moving a speaker around the array changes the reported angle.
+
+### Array Geometry (USER-PROVIDED, editable)
+
+The test array is a planar (2D) **square-ish array** of the 4 stereo pairs. Spacings the
+user measured: **27.1 mm between the two mics of a pair**, **19.37 mm between adjacent pairs**.
+The firmware encodes this as a 2x4 grid in an editable table `mic_pos[8][2]` (metres, near
+`DOA_Init` in `Src/main.c`): pair `p` at `x = p * 19.37 mm`; the pair's two mics (L = side 0,
+R = side 1) at `y = 0` and `y = 27.1 mm`; channel index = `pair*2 + side`. **If the real layout
+differs, edit only that table** - the solver is geometry-agnostic.
+
+### What Was Added (`Src/main.c`, guarded by `DOA_ENABLE`)
+
+- **Sub-sample TDOA.** The array is tiny: max delay = 58 mm / 343 m/s ~= 2.7 samples at 16 kHz,
+  so integer lags are far too coarse for an angle. `GCC_PHAT` now also does a **parabolic
+  interpolation** around the correlation peak (`g_last_frac`); `GCC_ProcessPairs` stores the
+  fractional lags in `g_tdoa_lag_f[]`. The int return is unchanged, so the TASK-08 self-test
+  still reads lag 5.
+- **Least-squares plane-wave solver.** Far-field model: each baseline `d_k = pos[k+1]-pos[0]`
+  obeys `d_k . u = -(C/Fs) * lag_k`, with `u` the unit direction to the source. `DOA_Init`
+  precomputes the 2x7 pseudo-inverse `M = -(C/Fs)*(DtD)^-1 Dt` so each frame is `u = M . lag_f`
+  (just 14 MACs). `DOA_Compute` returns azimuth = `atan2(u_y,u_x)` (0..360, measured in the
+  array x-y plane: 0 deg = +x / pair axis, CCW) and elevation = `acos(|u|)` (0 = in-plane,
+  90 = overhead; a planar array cannot tell above from below, so elevation is a magnitude).
+- **DOA_SelfTest** (runs at bring-up like the FFT/GCC self-tests): synthesizes the lags a known
+  in-plane source at `DOA_SELFTEST_AZ` (30 deg) would produce and confirms the solver recovers it.
+- **DOA_Task** now solves DOA on each `result_queue` item and prints `DOA seq= az= el=` ~1 Hz on
+  the VCP, toggling `LED_GREEN` per fix. Floats are printed as integer tenths (`%f` is not linked
+  in - newlib-nano without `-u _printf_float`).
+- The `result_queue` payload `tdoa_result_t.lag[]` changed from `int32_t` to `float` (fractional).
+
+### Bug Found & Fixed - defaultTask stack overflow corrupted result_queue
+
+The first hardware run printed the DOA **self-test OK** but **no live `DOA seq=` lines**. Diagnosis
+(VCP counters + an ST-LINK read of the queue control block): every `osMessageQueuePut` returned
+`osErrorResource` and `DOA_Task` blocked forever, because the queue reported **capacity 0**
+(`uxLength`/`uxItemSize` zeroed) even though its storage pointers proved it had been created
+correctly as 4x32. Root cause: **`defaultTask` had only 128 words of stack** but runs
+`MX_USB_DEVICE_Init()` (stack-hungry). It overflowed (TASK-09's `vTaskList` even showed
+`defaultTask` stack-free = **0**) and wrote down into the FreeRTOS heap, zeroing the
+`result_queue` control block - the first heap allocation. This had **silently broken the
+FFT_Task->DOA_Task IPC since TASK-09** (TASK-09's check never asserted a DOA line, so it went
+unnoticed). Fix: raise `defaultTask` stack to 512 words. After that, `cap=4`, every put/get
+succeeds, and live DOA flows. See `debug/bugs_encountered.md`.
+
+### Verification - PASSED on hardware
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/check_task11_doa.ps1
+```
+
+Options: `-NoFlash`, `-Port COM3`, `-ReadSeconds 14`. Report: `debug/task11_doa_report.txt`.
+
+```text
+--- TASK-11 DOA ---
+self-test: az 30 -> az 30 el 0 (expected az 30 el 0)
+TASK-11 self-test OK (azimuth within +/-2 deg).
+DOA seq=16 az=133.6 el=0.0
+DOA seq=32 az=163.4 el=57.2
+...
+[ OK ] DOA solver self-test passed (synthetic azimuth recovered)
+[ OK ] Live DOA output present (15 fix(es))
+[ OK ] All az in [0,360) and el in [0,90]
+[ OK ] Pipeline healthy (overruns=0)
+TASK-11 DOA check passed.
+```
+
+- **Self-test:** synthetic azimuth 30 deg -> recovered 30 deg, elevation 0 - validates the linear
+  algebra + `mic_pos` wiring independently of the mics.
+- **Live:** valid az/el every fix, `overruns=0`. Without an acoustic source the dominant signal is
+  common-mode ~50 Hz mains hum (near-zero inter-mic delay), so the live azimuth is noise-driven and
+  wanders - expected. The **"speaker moves -> angle changes" step is manual**: wave a steady tone
+  near the array and watch the live `az`/`el` on COM3 (re-run with `-NoFlash`).
+
+> **Resolution caveat:** with a ~58 mm aperture at 16 kHz the angular resolution is coarse even
+> with sub-sample interpolation. For sharper DOA, a larger array, a higher sample rate, or
+> averaging several frames would help (future work / TASK-13).
+
+---
+
+## TASK-12 - Monitor & Watchdog
+
+**Status:** DONE - verified on hardware.
+
+**Goal:** Feed an independent watchdog, count DMA/SAI overruns, and report task stack
+high-water marks; "Done when" = overruns=0 after 60 s capture and stack high-water > 10%.
+
+### What Was Added (`Src/main.c`, `Monitor_Task` = StartTask05)
+
+- **IWDG watchdog**, driven **directly via registers** (the HAL IWDG module is disabled in this
+  project; register access also survives a CubeMX regen). LSI ~32 kHz, prescaler /64, reload 1000
+  -> **~2.0 s timeout**, frozen while the debugger halts the core (`__HAL_DBGMCU_FREEZE_IWDG1`).
+  `Monitor_Task` starts it after bring-up and **feeds it every ~0.5 s, but only while `g_blocks`
+  keeps changing** - so a hung/stalled DSP pipeline stops the feed and the IWDG resets the MCU.
+- **`HAL_SAI_ErrorCallback`** counts hardware SAI errors into `g_sai_errors` (+ `g_sai_err_code`,
+  LED_RED), distinct from `g_overruns` (the software "FFT_Task didn't keep up" counter).
+- **`SAI2_IRQn` enabled** (NVIC priority 5) in `HAL_SAI_MspInit`, with a new `SAI2_IRQHandler`
+  in `stm32h7xx_it.c` calling `HAL_SAI_IRQHandler` for both SAI2 blocks. This **closes the TASK-04
+  follow-up**: SAI2 overrun/error interrupts now reach the callback (previously only SAI1's IRQ was
+  enabled; SAI2 relied on the DMA error path alone).
+- **Stack high-water reporting**: a new `[STK] def= fft= usb= doa= mon=` line (min free words per
+  task), plus `saiErr=` appended to the `[MON]` line. The `[MON]` prefix/format is otherwise
+  unchanged so the TASK-09 check still parses it.
+- **Reset-cause reporting**: `Print_ResetCause()` prints `last reset: ...` (IWDG/PIN/BOR/SFT/POR)
+  at bring-up and clears the flags, so an IWDG-triggered reset is visible on the next boot.
+
+### Verification - PASSED on hardware
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/check_task12_monitor.ps1 -ReadSeconds 60
+```
+
+Options: `-NoFlash`, `-Port COM3`, `-ReadSeconds` (default 60). Report: `debug/task12_monitor_report.txt`.
+
+```text
+[ OK ] Reset-cause reported: 'PIN'
+[ OK ] Monitor lines: 30, blocks 24 -> 953
+[ OK ] Pipeline advancing (blocks climbed by 929)
+[ OK ] overruns=0 across the whole window
+[ OK ] saiErr=0 across the whole window (SAI1+SAI2)
+[ OK ] Stack high-water (free words): def=344 fft=1874 usb=463 doa=358 mon=365
+[ OK ] All tasks keep > 10% stack headroom
+TASK-12 Monitor/Watchdog check passed.
+```
+
+- **60 s continuous**: `overruns=0`, `saiErr=0`, blocks climbed 24->953 (~15.5/s), no mid-run reset
+  -> the watchdog is being fed correctly the whole time.
+- **Stack high-water** (free words, allocated): def 344/512, fft 1874/2048, usb 463/512,
+  doa 358/512, mon 365/512 - all well above the 10% floor.
+
+### IT-07 watchdog proof (manual, demonstrated)
+
+Temporarily stalling the pipeline (`vTaskSuspend(NULL)` in `FFT_Task` after 80 blocks) froze
+`g_blocks`; `Monitor_Task` stopped feeding and the **IWDG reset the MCU in ~2 s**, after which the
+next boot printed **`last reset: IWDG`** (captured twice as the board reset-looped). The temporary
+stall was then removed and the clean firmware confirmed to run indefinitely (`last reset: PIN`,
+blocks climb past 80, 0 IWDG resets). This is the destructive IT-07 case from the breakdown.

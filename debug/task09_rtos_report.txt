@@ -1,5 +1,5 @@
 TASK-09 RTOS tasks and IPC report
-Generated: 2026-06-01 03:05:08
+Generated: 2026-06-01 22:17:53
 
 TASK-09 RTOS Tasks + IPC Verify
 ELF : C:\Users\huybu\OneDrive\Máy tính\code_TN\STM32CubeIDE\Debug\code_ver2_Fs16khz.elf
@@ -43,7 +43,7 @@ Download in Progress:
 ?????????????????????????????????????????????????? 100%
 
 File download complete
-Time elapsed during download operation: 00:00:00.621
+Time elapsed during download operation: 00:00:00.609
 
 MCU Reset
 
@@ -66,8 +66,8 @@ TASK-08 self-test OK (lag within +/-1 sample).
 Monitor_Task   	X	8	455	5
 USB_Task       	S	48	452	3
 FFT_Task       	S	40	1874	2
-DOA_Task       	B	32	452	4
-[MON] blocks=24 overruns=0 fft=7690us gcc=25585us heapFree=17136
+DOA_Task       	B	32	453	4
+[MON] blocks=24 overruns=0 fft=7689us gcc=25588us heapFree=17136
 --------------------------------
 
 [ OK ] TASK-07 FFT self-test still passes under RTOS
@@ -75,9 +75,9 @@ DOA_Task       	B	32	452	4
 [ OK ] vTaskList printed
 [ OK ] FFT_Task present (state=S, stack_free=1874 words)
 [ OK ] USB_Task present (state=S, stack_free=452 words)
-[ OK ] DOA_Task present (state=B, stack_free=452 words)
+[ OK ] DOA_Task present (state=B, stack_free=453 words)
 [ OK ] Monitor_Task present (state=X, stack_free=455 words)
-[ OK ] Monitor line seen: blocks=24 overruns=0 fft=7690us gcc=25585us heapFree=17136
+[ OK ] Monitor line seen: blocks=24 overruns=0 fft=7689us gcc=25588us heapFree=17136
 
 TASK-09 RTOS check passed.
 Report written to: C:\Users\huybu\OneDrive\Máy tính\code_TN\debug\task09_rtos_report.txt

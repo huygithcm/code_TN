@@ -1,0 +1,99 @@
+TASK-11 DOA (direction of arrival) report
+Generated: 2026-06-01 23:03:53
+
+TASK-11 DOA Verify
+ELF : C:\Users\huybu\OneDrive\Máy tính\code_TN\STM32CubeIDE\Debug\code_ver2_Fs16khz.elf
+Port: COM3 @ 115200
+
+Flashing firmware and resetting...
+      -------------------------------------------------------------------
+                       STM32CubeProgrammer v2.22.0                  
+      -------------------------------------------------------------------
+
+ST-LINK SN  : 003500503132510838363431
+ST-LINK FW  : V3J17M10
+Board       : NUCLEO-H7A3ZI-Q
+Voltage     : 3.29V
+SWD freq    : 8000 KHz
+Connect mode: Under Reset
+Reset mode  : Hardware reset
+Device ID   : 0x480
+Revision ID : Rev X
+Device name : STM32H7A/B
+NVM size  : 2 MBytes
+Device type : MCU
+Device CPU  : Cortex-M7
+BL Version  : 0x92
+
+
+
+Opening and parsing file: code_ver2_Fs16khz.elf
+
+
+Memory Programming ...
+  File          : code_ver2_Fs16khz.elf
+  Size          : 179.09 KB 
+  Address       : 0x08000000
+
+
+Erasing memory corresponding to segment 0:
+Erasing internal memory sectors [0 22]
+Download in Progress:
+?????????????????????????????????????????????????? 0%
+?????????????????????????????????????????????????? 100%
+
+File download complete
+Time elapsed during download operation: 00:00:00.642
+
+MCU Reset
+
+Software reset is performed
+
+Reading COM3 for up to 14 s (waiting for DOA self-test + live fixes)...
+
+----- VCP output (excerpt) -----
+self-test: 1000 Hz -> peak bin 64 (expected 64) mag=255
+TASK-07 self-test OK (peak within +/-1 bin).
+self-test: delay 5 -> lag 5 (expected 5)
+TASK-08 self-test OK (lag within +/-1 sample).
+--- TASK-11 DOA ---
+self-test: az 30 -> az 30 el 0 (expected az 30 el 0)
+TASK-11 self-test OK (azimuth within +/-2 deg).
+DOA seq=16 az=133.6 el=0.0
+[MON] blocks=24 overruns=0 fft=7746us gcc=25752us heapFree=15592
+DOA seq=32 az=163.4 el=57.2
+DOA seq=48 az=153.6 el=48.8
+[MON] blocks=56 overruns=0 fft=7740us gcc=25636us heapFree=15592
+DOA seq=64 az=133.2 el=0.0
+DOA seq=80 az=155.9 el=50.7
+[MON] blocks=87 overruns=0 fft=7748us gcc=25637us heapFree=15592
+DOA seq=96 az=156.8 el=50.9
+DOA seq=112 az=153.1 el=49.4
+[MON] blocks=119 overruns=0 fft=7745us gcc=25685us heapFree=15592
+DOA seq=128 az=159.1 el=53.0
+DOA seq=144 az=320.7 el=0.0
+[MON] blocks=151 overruns=0 fft=7743us gcc=25661us heapFree=15592
+DOA seq=160 az=312.6 el=0.0
+DOA seq=176 az=153.1 el=51.3
+[MON] blocks=183 overruns=0 fft=7743us gcc=25615us heapFree=15592
+DOA seq=192 az=297.2 el=0.0
+DOA seq=208 az=160.4 el=66.3
+[MON] blocks=215 overruns=0 fft=7744us gcc=25795us heapFree=15592
+DOA seq=224 az=149.9 el=65.2
+DOA seq=240 az=150.7 el=51.9
+--------------------------------
+
+[ OK ] TASK-07 FFT self-test still passes
+[ OK ] TASK-08 GCC-PHAT self-test still passes
+[ OK ] DOA solver self-test passed (synthetic azimuth recovered)
+[ OK ] Live DOA output present (15 fix(es))
+       fixes: az=133.6 el=0  |  az=163.4 el=57.2  |  az=153.6 el=48.8  |  az=133.2 el=0  |  az=155.9 el=50.7  |  az=156.8 el=50.9  |  az=153.1 el=49.4  |  az=159.1 el=53  |  az=320.7 el=0  |  az=312.6 el=0  |  az=153.1 el=51.3  |  az=297.2 el=0  |  az=160.4 el=66.3  |  az=149.9 el=65.2  |  az=150.7 el=51.9
+[ OK ] All az in [0,360) and el in [0,90]
+[ OK ] Pipeline healthy (overruns=0)
+
+Note: 'speaker moves -> angle changes' is a manual check. Wave a sound
+source around the array and watch the live az/el on COM3 (re-run with
+-NoFlash to avoid resetting), or compare fixes above.
+
+TASK-11 DOA check passed.
+Report written to: C:\Users\huybu\OneDrive\Máy tính\code_TN\debug\task11_doa_report.txt

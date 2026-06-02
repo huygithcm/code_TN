@@ -5,6 +5,98 @@ symptom → root cause → fix. Newest first. Append new entries as they come up
 
 ---
 
+## 2026-06-01 — TASK-11 DOA
+
+### BUG-12 — defaultTask stack overflow zeroed the result_queue control block (DOA IPC dead since TASK-09)
+
+- **Where:** `Src/main.c`, `defaultTask_attributes.stack_size` (was `128 * 4`) and the
+  `FFT_Task -> result_queue -> DOA_Task` IPC path.
+- **Symptom:** TASK-11's DOA **self-test printed OK**, but **no live `DOA seq=` lines** ever
+  appeared. The same was silently true back in TASK-09 (its `vTaskList` showed `DOA_Task` blocked
+  and its report has zero DOA lines — the check just never asserted them).
+- **Diagnosis:** Instrumented the queue with VCP counters → `puts=0 putfail=ALL gets=0`, every
+  `osMessageQueuePut` returning `osErrorResource` (−3, "queue full") while `DOA_Task` stayed
+  blocked on an apparently empty queue. `osMessageQueueGetCapacity` reported **0**. An ST-LINK read
+  of the queue control block (`-r32 <handle>`) showed the **storage pointers still sized for 4×32**
+  (pcTail = pcHead + 128) but `uxLength`/`uxItemSize` **zeroed** → created correctly, then corrupted.
+- **Root cause:** `defaultTask` had only **128 words** of stack but runs `MX_USB_DEVICE_Init()`
+  (stack-hungry). It overflowed (TASK-09's `vTaskList` literally showed `defaultTask` stack-free
+  = **0**) and wrote **down past its stack into the FreeRTOS heap**, hitting the `result_queue`
+  control block — the *first* heap allocation, sitting at the very start of `ucHeap` — and zeroing
+  `uxLength`/`uxItemSize`. With `uxLength = 0` every send sees a "full" queue and every receive
+  blocks forever.
+- **Fix:** raise `defaultTask` stack to **512 words**. After that `cap=4`, every put/get succeeds,
+  and live DOA flows. (General lesson: a task whose `vTaskList` stack-free hits 0 is overflowing;
+  on this project it corrupts the heap-resident queue/TCBs, not the task's own data, so the failure
+  shows up far from the cause.)
+- **Note:** the TASK-09 summary claim that "DOA_Task drains result_queue and prints live lag
+  vectors" was therefore never actually exercised end-to-end; TASK-11 is where the IPC first runs.
+
+---
+
+## 2026-06-01 — CMSIS-DSP build integration into the CubeIDE project model (TASK-07/09)
+
+Hit while rebuilding TASK-09 on a fresh checkout and then making it build from the
+STM32CubeIDE GUI (not just the CLI). Net result: the five CMSIS-DSP aggregate units are
+now registered as **linked source files** in `STM32CubeIDE/.project`, with a per-folder
+`-O2` override in `STM32CubeIDE/.cproject`, so CubeIDE (GUI *and* headless) regenerates the
+DSP build rules and links automatically. This **supersedes** the old TASK-07 note that said
+to re-apply the CLI `subdir.mk` / `objects.list` / `makefile` wiring by hand after every regen.
+
+### BUG-11 — CubeIDE per-folder `-O2` override silently drops inherited `-I` / `-D`
+
+- **Where:** `STM32CubeIDE/.cproject`, Debug config, the per-folder `<folderInfo
+  resourcePath="Drivers/CMSIS/DSP">` override.
+- **Symptom:** After registering the DSP units as linked sources and adding a `-O2` folder
+  override, the headless/GUI build regenerated `Debug/Drivers/CMSIS/DSP/subdir.mk` with
+  `-c -O2` but **no `-I` include paths and no `-D` defines** → `arm_math.h` not found,
+  11 compile errors on the DSP `.o` files.
+- **Root cause:** In CDT managed build, a per-resource (folder) `<tool>` that redefines the
+  compiler via `superClass` does **not** inherit option *instances* (include paths, defines)
+  from the root `folderInfo` — it starts from the tool superClass defaults, which are empty.
+  Only the one option I set (optimization) was applied; everything else was lost for that folder.
+- **Fix:** embed the full `Include paths (-I)` and `Define symbols (-D)` option lists into the
+  override tool *alongside* the optimization option (copied from the root C-compiler tool).
+  After that the regenerated rule carries `-O2` + all `-I` + `USE_HAL_DRIVER`/`STM32H7A3xxQ`,
+  and links clean (`text=179356`). Verified with headless
+  `org.eclipse.cdt.managedbuilder.core.headlessbuild -cleanBuild`.
+- **Side notes:** (a) also added `Drivers/CMSIS/DSP/PrivateInclude` to the C-compiler include
+  paths (Debug **and** Release) — some component `.c` files pulled in by the aggregates need it;
+  (b) the headless `-import` drops a stray generic `.project` (named `code_TN`) at the repo root
+  for the parent folder — delete it, it is not part of the project.
+
+### BUG-10 — Hand-written `subdir.mk`: "output filename may not be empty"
+
+- **Where:** `Debug/Drivers/CMSIS/DSP/subdir.mk` (the interim hand-written CLI version, before
+  BUG-11's project-model fix).
+- **Symptom:** `arm-none-eabi-gcc: fatal error: output filename may not be empty` for all five
+  DSP units; the echoed command showed `-MF"" -MT"" ... -o ""`.
+- **Root cause:** I put the compile flags — including `-MF"$(@:%.o=%.d)" -MT"$@" -o "$@"` — into a
+  `:=` (immediately-expanded) make variable. `$@` and `$(@:%.o=%.d)` are automatic variables that
+  only exist inside a recipe; with `:=` they expand at parse time, where they are empty.
+- **Fix:** define the flags variable with `=` (deferred expansion) so `$@` resolves per-target
+  when the recipe runs. (Moot after BUG-11 — CubeIDE now generates the rules.)
+
+### BUG-09 — CLI link fails: CMSIS-DSP symbols undefined on a fresh checkout
+
+- **Where:** CLI `make` build under `STM32CubeIDE/Debug/`; references from `Src/main.c`
+  `FFT_Init` / `FFT_ProcessAll` / `FFT_SelfTest` / `GCC_PHAT`.
+- **Symptom:** `undefined reference to 'arm_rfft_fast_init_f32'` (also `arm_mult_f32`,
+  `arm_rfft_fast_f32`, `arm_cmplx_mag_f32`, `arm_max_f32`), plus
+  `Unknown destination type (ARM/Thumb)` and `dangerous relocation: unsupported relocation`,
+  ending in `collect2.exe: error: ld returned 1 exit status`.
+- **Root cause:** `Debug/` is **gitignored**, so a fresh checkout has none of the CMSIS-DSP build
+  wiring — the five aggregate units were never compiled and `objects.list`/`makefile` didn't
+  reference them. The DSP *source* is in the repo (`Drivers/CMSIS/DSP/Source`) but nothing built it.
+  (The `Unknown destination type` noise is the linker reacting to calls to symbols it never got an
+  object for.)
+- **Fix (interim, CLI):** create `Debug/Drivers/CMSIS/DSP/subdir.mk` (compile the 5 units at `-O2`),
+  add `-include Drivers/CMSIS/DSP/subdir.mk` to `Debug/makefile`, and add the 5 `.o` to
+  `Debug/objects.list`. **Durable fix:** BUG-11 — register the units in the project model so any
+  CubeIDE/CLI build regenerates the wiring (no more gitignored hand-edits).
+
+---
+
 ## 2026-06-01 — FreeRTOS bring-up (TASK-09, after CubeMX regenerate)
 
 Found while reviewing the project right after enabling FreeRTOS in CubeMX. The RTOS
@@ -97,8 +189,8 @@ This project keeps the flat `Src/` + `Inc/` layout (no `Core/Src`, `Core/Inc`).
 The regenerate edited files in place and preserved all USER CODE blocks, so the
 TASK-07/08 code in `Src/main.c` USER CODE 4 survived intact. The linker `KEEP()`
 sections (`.DTCMSection`/`.DMASection`/`.USBSection`) and 1 MB AXI SRAM region also
-survived. (CLI builds still need `Debug/` regenerated with the new FreeRTOS sources
-**and** the CMSIS-DSP wiring re-applied — see BUG note in the TASK-07 build section.)
+survived. (CMSIS-DSP is now part of the project model, so CLI/IDE builds regenerate the
+DSP wiring automatically — see BUG-09/BUG-11 above; no hand-editing of `Debug/` needed.)
 
 ---
 
