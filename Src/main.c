@@ -4,7 +4,7 @@
   * @file           : main.c
   * @brief          : Main program body
   * @author VŨ ĐÔNG TRIỀU
-  *
+  * @date   7/6/2026  
   * 
   ******************************************************************************
   * @attention
@@ -76,13 +76,15 @@
 /* TASK-11: direction of arrival from the live mic0-vs-mic1..7 TDOAs. Planar (2D)
  * array, far-field plane-wave least-squares -> azimuth (+ elevation magnitude).
  * EDIT mic_pos[][] (near DOA_Init) to match the physical array. Current layout:
- * a 2x4 grid of the 4 stereo pairs - each pair is a column of 2 mics
- * MIC_INPAIR_SPACING_M apart (y); the 4 columns are MIC_PAIR_SPACING_M apart (x).
- * Channel index = pair*2 + side, side 0 = L, side 1 = R (matches the SAI mapping). */
+ * UCA diameter 80 mm, each SAI pair wires two OPPOSITE mics (across a diameter):
+ *   pair0: ch0=0deg,  ch1=180deg
+ *   pair1: ch2=45deg, ch3=225deg
+ *   pair2: ch4=90deg, ch5=270deg
+ *   pair3: ch6=135deg,ch7=315deg
+ * Azimuth 0 deg = +x (ch0 direction), positive CCW. */
 #define DOA_ENABLE           1
 #define C_SOUND_MPS          343.0f                       /* speed of sound @ 20 C      */
-#define MIC_PAIR_SPACING_M   0.01937f                     /* 19.37 mm between pairs (x) */
-#define MIC_INPAIR_SPACING_M 0.02710f                     /* 27.1 mm within a pair (y)  */
+#define MIC_ARRAY_RADIUS_M   0.040f                       /* UCA radius = 40 mm         */
 #define DOA_NPAIRS           GCC_NPAIRS_LIVE              /* 7 baselines: mic0 vs 1..7  */
 #define DOA_SELFTEST_AZ      30.0f                        /* synthetic source azimuth   */
 
@@ -1152,22 +1154,22 @@ void GCC_ProcessPairs(void)
 }
 
 #if DOA_ENABLE
-/* TASK-11: physical mic coordinates in metres, channel-major (ch = pair*2 + side).
- * >>> EDIT THIS TABLE to match the real array <<<. Default = 2x4 grid: pair p sits
- * at x = p * MIC_PAIR_SPACING_M; the pair's two mics (L = side 0, R = side 1) at
- * y = 0 and y = MIC_INPAIR_SPACING_M. The x axis is the pair (column) axis, the y
- * axis is the in-pair axis. Only differences relative to mic0 matter, so the origin
- * is arbitrary. Azimuth below is measured in this x-y plane: 0 deg = +x, 90 = +y, CCW. */
+/* TASK-11: physical mic coordinates in metres, channel-major.
+ * UCA diameter 80mm. Each SAI pair wires two diametrically opposed mics:
+ *   pair p -> ch_L = p*2 at (p*45 deg), ch_R = p*2+1 at (p*45+180 deg).
+ * R = MIC_ARRAY_RADIUS_M = 0.040 m. */
+#define MIC_R  MIC_ARRAY_RADIUS_M
 static const float mic_pos[NUM_MIC_CHANNELS][2] = {
-  { 0.0f * MIC_PAIR_SPACING_M, 0.0f                },  /* ch0  pair0 L */
-  { 0.0f * MIC_PAIR_SPACING_M, MIC_INPAIR_SPACING_M },  /* ch1  pair0 R */
-  { 1.0f * MIC_PAIR_SPACING_M, 0.0f                },  /* ch2  pair1 L */
-  { 1.0f * MIC_PAIR_SPACING_M, MIC_INPAIR_SPACING_M },  /* ch3  pair1 R */
-  { 2.0f * MIC_PAIR_SPACING_M, 0.0f                },  /* ch4  pair2 L */
-  { 2.0f * MIC_PAIR_SPACING_M, MIC_INPAIR_SPACING_M },  /* ch5  pair2 R */
-  { 3.0f * MIC_PAIR_SPACING_M, 0.0f                },  /* ch6  pair3 L */
-  { 3.0f * MIC_PAIR_SPACING_M, MIC_INPAIR_SPACING_M },  /* ch7  pair3 R */
+  {  MIC_R * 1.00000f,  MIC_R * 0.00000f },  /* ch0  pair0 L    0 deg */
+  { -MIC_R * 1.00000f,  MIC_R * 0.00000f },  /* ch1  pair0 R  180 deg */
+  {  MIC_R * 0.70711f,  MIC_R * 0.70711f },  /* ch2  pair1 L   45 deg */
+  { -MIC_R * 0.70711f, -MIC_R * 0.70711f },  /* ch3  pair1 R  225 deg */
+  {  MIC_R * 0.00000f,  MIC_R * 1.00000f },  /* ch4  pair2 L   90 deg */
+  {  MIC_R * 0.00000f, -MIC_R * 1.00000f },  /* ch5  pair2 R  270 deg */
+  { -MIC_R * 0.70711f,  MIC_R * 0.70711f },  /* ch6  pair3 L  135 deg */
+  {  MIC_R * 0.70711f, -MIC_R * 0.70711f },  /* ch7  pair3 R  315 deg */
 };
+#undef MIC_R
 
 /**
   * @brief  TASK-11 - precompute the least-squares pseudo-inverse for the DOA solve.
