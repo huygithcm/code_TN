@@ -1,19 +1,20 @@
 USB CDC raw stream check
-Generated: 2026-06-01 02:56:21
+Generated: 2026-06-11 00:19:01
 
 TASK-06 USB CDC Raw Stream Check
-Using OTG CDC port: COM12
+Auto-detected OTG CDC port: COM12
 Expecting frames: magic=RAW1 nch=8 nsamp=1024 fmt=0 (32780 bytes each)
-Need 4 valid frame(s) within 20 s.
+Need 5 valid frame(s) within 20 s.
 
-Captured 266272 bytes from COM12
+Captured 297452 bytes from COM12
 
-frame 1: seq=1  ch0[-8310..13028] ch1[-7099..9583] ch2[-8369..15494] ch3[-7524..10915] ch4[-5876..9354] ch5[-6890..11866] ch6[-9315..10891] ch7[-6091..3760]
-frame 2: seq=2  ch0[-10338..6440] ch1[-7795..6813] ch2[-10825..6666] ch3[-8317..7179] ch4[-7893..7442] ch5[-7551..8179] ch6[-5346..8039] ch7[-9006..6534]
-frame 3: seq=3  ch0[-7556..6190] ch1[-6947..6415] ch2[-8124..8549] ch3[-7006..7856] ch4[-4999..6152] ch5[-7433..7225] ch6[-4528..7340] ch7[-10244..7963]
-frame 4: seq=4  ch0[-4202..7182] ch1[-5761..5860] ch2[-5912..6854] ch3[-6276..6281] ch4[-5504..5179] ch5[-6504..6523] ch6[-5730..5559] ch7[-6158..4446]
+frame 1: seq=13679  ch0[-6598..9500] ch1[-6131..7042] ch2[-5688..8061] ch3[-6267..5301] ch4[-6231..6575] ch5[-5424..7709] ch6[-3155..5415] ch7[-5357..8038]
+frame 2: seq=13680  ch0[-8654..9387] ch1[-6933..7175] ch2[-7363..7436] ch3[-5644..5701] ch4[-6417..7196] ch5[-6813..7020] ch6[-7595..5638] ch7[-7299..8144]
+frame 3: seq=13681  ch0[-7841..7252] ch1[-6077..6323] ch2[-8167..6372] ch3[-5052..4757] ch4[-6702..5789] ch5[-5622..5858] ch6[-5386..7499] ch7[-7012..7183]
+frame 4: seq=13682  ch0[-6580..8162] ch1[-5126..6473] ch2[-6786..6163] ch3[-5488..4651] ch4[-5432..6400] ch5[-4475..6687] ch6[-6562..5894] ch7[-4911..6635]
+frame 5: seq=13683  ch0[-10212..9072] ch1[-7724..7653] ch2[-8271..8843] ch3[-6687..7001] ch4[-8000..6624] ch5[-7588..7090] ch6[-5003..7009] ch7[-9011..7010]
 
-[ OK ] Received 4 valid RAW1 frame(s)
+[ OK ] Received 5 valid RAW1 frame(s)
 [ OK ] Headers valid (nch=8 nsamp=1024 fmt=0)
 [ OK ] Sequence counter advanced
 [ OK ] All samples within 24-bit range

@@ -896,10 +896,15 @@ static void Deinterleave_Pair(uint32_t off, uint8_t pair)
   const int32_t *src = &dma_buf[pair][off];
   uint8_t l = (uint8_t)(pair * 2U);
   uint8_t r = (uint8_t)(pair * 2U + 1U);
+  /* Mics on ch3 (SAI1-B slot 1) and ch6 (SAI2-B slot 0) are wired with
+   * inverted polarity; negate to restore phase alignment with the other
+   * channels (needed for GCC-PHAT). */
+  const int32_t l_sign = (l == 6U) ? -1 : 1;
+  const int32_t r_sign = (r == 3U) ? -1 : 1;
   for (uint32_t i = 0U; i < AUDIO_BLOCK_SAMPLES; i++)
   {
-    int32_t rl = (int16_t)(src[2U * i] & 0xFFFF);
-    int32_t rr = (int16_t)(src[2U * i + 1U] & 0xFFFF);
+    int32_t rl = l_sign * (int32_t)(int16_t)(src[2U * i] & 0xFFFF);
+    int32_t rr = r_sign * (int32_t)(int16_t)(src[2U * i + 1U] & 0xFFFF);
     mic_raw[l][i]  = rl;
     mic_raw[r][i]  = rr;
     mic_data[l][i] = (float)rl * (1.0f / 8388608.0f);
@@ -1158,6 +1163,7 @@ void GCC_ProcessPairs(void)
  * UCA diameter 80mm. Each SAI pair wires two diametrically opposed mics:
  *   pair p -> ch_L = p*2 at (p*45 deg), ch_R = p*2+1 at (p*45+180 deg).
  * R = MIC_ARRAY_RADIUS_M = 0.040 m. */
+
 #define MIC_R  MIC_ARRAY_RADIUS_M
 static const float mic_pos[NUM_MIC_CHANNELS][2] = {
   {  MIC_R * 1.00000f,  MIC_R * 0.00000f },  /* ch0  pair0 L    0 deg */
