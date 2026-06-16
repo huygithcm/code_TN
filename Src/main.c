@@ -68,26 +68,29 @@
 #define FFT_SELFTEST_HZ      1000.0f                      /* self-test tone -> bin 64   */
 #define PI_F                 3.14159265358979f
 
-/* TASK-08: GCC-PHAT time-delay estimation between mic pairs. */
+/* TASK-08: GCC-PHAT time-delay estimation between OPPOSITE mic pairs.
+ * Each SAI pair wires two diametrically opposed mics, so the 4 baselines are
+ * full-diameter (max aperture) and span 0/45/90/135 deg:
+ *   pair0: ch0=0deg  vs ch1=180deg   baseline along 0 deg
+ *   pair1: ch2=45deg vs ch3=225deg   baseline along 45 deg
+ *   pair2: ch4=90deg vs ch5=270deg   baseline along 90 deg
+ *   pair3: ch6=135deg vs ch7=315deg  baseline along 135 deg */
 #define GCC_ENABLE           1
 #define GCC_SELFTEST_SHIFT   5                            /* synthetic delay -> lag 5   */
-#define GCC_NPAIRS_LIVE      (NUM_MIC_CHANNELS - 1U)      /* live demo: mic0 vs mic1..7 */
+#define GCC_NPAIRS_LIVE      (NUM_MIC_CHANNELS / 2U)      /* 4 opposite-mic pairs       */
 
-/* TASK-11: direction of arrival from the live mic0-vs-mic1..7 TDOAs. Planar (2D)
- * array, far-field plane-wave least-squares -> azimuth (+ elevation magnitude).
- * EDIT mic_pos[][] (near DOA_Init) to match the physical array. Current layout:
- * UCA diameter 80 mm, each SAI pair wires two OPPOSITE mics (across a diameter):
- *   pair0: ch0=0deg,  ch1=180deg
- *   pair1: ch2=45deg, ch3=225deg
- *   pair2: ch4=90deg, ch5=270deg
- *   pair3: ch6=135deg,ch7=315deg
+/* TASK-11: direction of arrival from the 4 opposite-pair TDOAs, matched against
+ * a hardcoded delay table. The source is assumed to lie at one of 16 fixed
+ * directions (every 22.5 deg); we pick the table row whose expected lags best
+ * match the measured ones (minimum sum-of-squared error).
  * Azimuth 0 deg = +x (ch0 direction), positive CCW. */
 #define DOA_ENABLE           1
 #define C_SOUND_MPS          343.0f                       /* speed of sound @ 20 C      */
 #define MIC_ARRAY_RADIUS_M   0.040f                       /* UCA radius = 40 mm         */
-#define DOA_NPAIRS           GCC_NPAIRS_LIVE              /* 7 baselines: mic0 vs 1..7  */
-#define DOA_N_AZ             8U                           /* candidate directions (8x45°)*/
-#define DOA_SELFTEST_AZ      45.0f                        /* synthetic source azimuth (must be one of the 8 table directions) */
+#define DOA_NPAIRS           GCC_NPAIRS_LIVE              /* 4 opposite-pair baselines  */
+#define DOA_N_AZ             16U                          /* candidate directions (16x22.5°) */
+#define DOA_AZ_STEP          22.5f                        /* angular resolution (deg)   */
+#define DOA_SELFTEST_AZ      45.0f                        /* synthetic source azimuth (one of the 16 table dirs) */
 
 /* TASK-09: FreeRTOS task notification flags (FFT_Task waits on these). */
 #define FLAG_FFT             (1UL << 0)                   /* a fresh half is ready      */
@@ -98,9 +101,8 @@
 typedef struct
 {
   uint32_t seq;                       /* processed-block counter                  */
-  float    lag[GCC_NPAIRS_LIVE];      /* mic0 vs mic1..7, fractional samples (TASK-11) */
-  float    az;                        /* SRP delay-and-sum azimuth, degrees (discrete) */
-  float    contrast;                  /* SRP peak power / mean power (>=1)        */
+  float    lag[GCC_NPAIRS_LIVE];      /* 4 opposite-pair TDOAs, fractional samples */
+  float    level;                     /* ch0 frame RMS² (for the clap input gate) */
 } tdoa_result_t;
 /* USER CODE END PD */
 
@@ -232,20 +234,16 @@ float   gcc_r[FFT_SIZE];
 __attribute__((section(".DTCMSection"), aligned(32), used))
 float   gcc_corr[FFT_SIZE];
 
-volatile int32_t  g_tdoa_lag[GCC_NPAIRS_LIVE];  /* mic0 vs mic(k+1), samples (rounded) */
+volatile int32_t  g_tdoa_lag[GCC_NPAIRS_LIVE];  /* opposite-pair lags, samples (rounded) */
 float    g_tdoa_lag_f[GCC_NPAIRS_LIVE];          /* TASK-11: fractional lags (sub-sample) */
 volatile uint32_t g_gcc_us;                     /* time to compute the live pairs (us) */
 
 #if DOA_ENABLE
-/* TASK-11 DOA state.
- * g_doa_table[a][k]  = expected TDOA lag (samples) for direction a, baseline k.
- * g_doa_dly[a][k]    = the same lag rounded to integer samples, for delay-and-sum.
- * g_doa_err = SRP contrast (peak/mean power) of the last fix (higher = stronger). */
-float    g_doa_table[DOA_N_AZ][DOA_NPAIRS];
-int32_t  g_doa_dly[DOA_N_AZ][DOA_NPAIRS];
+/* TASK-11 DOA state. The delay table is hardcoded (see g_doa_table below).
+ * g_doa_err = normalised residual of the last fix (0 = perfect match). */
 volatile float g_doa_az;                         /* azimuth, degrees [0,360)   */
-volatile float g_doa_el;                         /* elevation magnitude, [0,90]*/
-volatile float g_doa_err;                        /* SRP contrast (>=1)         */
+volatile float g_doa_el;                         /* unused (planar), kept 0    */
+volatile float g_doa_err;                        /* normalised min residual    */
 #endif
 #endif
 #endif
@@ -295,9 +293,7 @@ int32_t GCC_PHAT(const float *a, const float *b);
 void GCC_SelfTest(void);
 void GCC_ProcessPairs(void);
 #if DOA_ENABLE
-void DOA_Init(void);
-void DOA_Compute(const float *lag_f, float *az_deg, float *el_deg);
-void DOA_SRP(float *az_deg, float *contrast);
+void DOA_Compute(const float *lag_f, float *az_deg, float *resid);
 void DOA_SelfTest(void);
 #endif
 #endif
@@ -1152,121 +1148,70 @@ void GCC_SelfTest(void)
 }
 
 /**
-  * @brief  TASK-08 - compute live TDOA lags for mic0 vs mic1..7 from mic_data,
-  *         timing the whole set with the DWT counter.
+  * @brief  TASK-08 - compute live TDOA lags between the 4 OPPOSITE mic pairs
+  *         (ch0-ch1, ch2-ch3, ch4-ch5, ch6-ch7) from mic_data, timing the whole
+  *         set with the DWT counter. Pair k uses channels 2k (lower angle) and
+  *         2k+1 (opposite); the lag sign matches the hardcoded DOA table.
   */
 void GCC_ProcessPairs(void)
 {
   uint32_t t0 = DWT->CYCCNT;
   for (uint32_t k = 0U; k < GCC_NPAIRS_LIVE; k++)
   {
-    g_tdoa_lag[k]   = GCC_PHAT(mic_data[0], mic_data[k + 1U]);
+    g_tdoa_lag[k]   = GCC_PHAT(mic_data[2U * k], mic_data[2U * k + 1U]);
     g_tdoa_lag_f[k] = g_last_frac;       /* TASK-11: sub-sample lag for DOA */
   }
   g_gcc_us = (DWT->CYCCNT - t0) / 64U;   /* cycles @ 64 MHz -> us */
 }
 
 #if DOA_ENABLE
-/* TASK-11: physical mic coordinates in metres, channel-major.
- * UCA diameter 80mm. Each SAI pair wires two diametrically opposed mics:
- *   pair p -> ch_L = p*2 at (p*45 deg), ch_R = p*2+1 at (p*45+180 deg).
- * R = MIC_ARRAY_RADIUS_M = 0.040 m. */
+/* TASK-11: physical mic geometry (UCA diameter 80mm, R = 0.040 m). Each SAI pair
+ * wires two diametrically opposed mics, channel-major angles:
+ *   ch0=0  ch1=180 | ch2=45 ch3=225 | ch4=90 ch5=270 | ch6=135 ch7=315  (deg)
+ * The geometry is baked into the hardcoded g_doa_table below, so no runtime
+ * coordinate array is needed. */
 
-#define MIC_R  MIC_ARRAY_RADIUS_M
-static const float mic_pos[NUM_MIC_CHANNELS][2] = {
-  {  MIC_R * 1.00000f,  MIC_R * 0.00000f },  /* ch0  pair0 L    0 deg */
-  { -MIC_R * 1.00000f,  MIC_R * 0.00000f },  /* ch1  pair0 R  180 deg */
-  {  MIC_R * 0.70711f,  MIC_R * 0.70711f },  /* ch2  pair1 L   45 deg */
-  { -MIC_R * 0.70711f, -MIC_R * 0.70711f },  /* ch3  pair1 R  225 deg */
-  {  MIC_R * 0.00000f,  MIC_R * 1.00000f },  /* ch4  pair2 L   90 deg */
-  {  MIC_R * 0.00000f, -MIC_R * 1.00000f },  /* ch5  pair2 R  270 deg */
-  { -MIC_R * 0.70711f,  MIC_R * 0.70711f },  /* ch6  pair3 L  135 deg */
-  {  MIC_R * 0.70711f, -MIC_R * 0.70711f },  /* ch7  pair3 R  315 deg */
-};
-#undef MIC_R
-
-/* Candidate azimuths for the table search (degrees, 8 directions × 45°). */
+/* Candidate azimuths (degrees, 16 directions × 22.5°). */
 static const float g_doa_angles[DOA_N_AZ] = {
-  0.0f, 45.0f, 90.0f, 135.0f, 180.0f, 225.0f, 270.0f, 315.0f
+    0.0f,  22.5f,  45.0f,  67.5f,  90.0f, 112.5f, 135.0f, 157.5f,
+  180.0f, 202.5f, 225.0f, 247.5f, 270.0f, 292.5f, 315.0f, 337.5f
+};
+
+/* TASK-11: HARDCODED TDOA table. g_doa_table[a][k] = expected lag (samples) on
+ * opposite pair k for a source at azimuth g_doa_angles[a].
+ * Pair k = GCC_PHAT(ch[2k], ch[2k+1]); baseline angle phi_k = k*45 deg.
+ * Formula:  lag = (Fs/C) * 2R * cos(az - phi_k),  (Fs/C)*2R = 3.731778 samples.
+ * Regenerate if Fs, R, or the pair wiring changes. */
+static const float g_doa_table[DOA_N_AZ][DOA_NPAIRS] = {
+  {   3.731778f,   2.638766f,   0.000000f,  -2.638766f },  /* az=  0.0 */
+  {   3.447714f,   3.447714f,   1.428090f,  -1.428090f },  /* az= 22.5 */
+  {   2.638766f,   3.731778f,   2.638766f,   0.000000f },  /* az= 45.0 */
+  {   1.428090f,   3.447714f,   3.447714f,   1.428090f },  /* az= 67.5 */
+  {   0.000000f,   2.638766f,   3.731778f,   2.638766f },  /* az= 90.0 */
+  {  -1.428090f,   1.428090f,   3.447714f,   3.447714f },  /* az=112.5 */
+  {  -2.638766f,   0.000000f,   2.638766f,   3.731778f },  /* az=135.0 */
+  {  -3.447714f,  -1.428090f,   1.428090f,   3.447714f },  /* az=157.5 */
+  {  -3.731778f,  -2.638766f,   0.000000f,   2.638766f },  /* az=180.0 */
+  {  -3.447714f,  -3.447714f,  -1.428090f,   1.428090f },  /* az=202.5 */
+  {  -2.638766f,  -3.731778f,  -2.638766f,   0.000000f },  /* az=225.0 */
+  {  -1.428090f,  -3.447714f,  -3.447714f,  -1.428090f },  /* az=247.5 */
+  {   0.000000f,  -2.638766f,  -3.731778f,  -2.638766f },  /* az=270.0 */
+  {   1.428090f,  -1.428090f,  -3.447714f,  -3.447714f },  /* az=292.5 */
+  {   2.638766f,   0.000000f,  -2.638766f,  -3.731778f },  /* az=315.0 */
+  {   3.447714f,   1.428090f,  -1.428090f,  -3.447714f },  /* az=337.5 */
 };
 
 /**
-  * @brief  TASK-11 - build TDOA look-up table.
-  *         For each of DOA_N_AZ candidate directions, the expected fractional lag
-  *         on baseline k is:
-  *           table[a][k] = -(Fs/C) * dot(pos[k+1]-pos[0], u_a)
-  *         where u_a = [cos(az_a), sin(az_a)].  At run-time DOA_Compute picks
-  *         the table row whose entries best match the measured lags (min SSE).
-  */
-void DOA_Init(void)
-{
-  float scale = -((float)AUDIO_FS_HZ / C_SOUND_MPS);   /* samples per metre */
-  for (uint32_t a = 0U; a < DOA_N_AZ; a++)
-  {
-    float az_r = g_doa_angles[a] * (PI_F / 180.0f);
-    float ux = cosf(az_r), uy = sinf(az_r);
-    for (uint32_t k = 0U; k < DOA_NPAIRS; k++)
-    {
-      float dx = mic_pos[k + 1U][0] - mic_pos[0][0];
-      float dy = mic_pos[k + 1U][1] - mic_pos[0][1];
-      g_doa_table[a][k] = scale * (dx * ux + dy * uy);
-      g_doa_dly[a][k]   = (int32_t)lroundf(g_doa_table[a][k]);
-    }
-  }
-}
-
-/* Max |delay| in samples = ceil(Fs * 2R / C); guards the delay-and-sum window. */
-#define DOA_DLY_MAX  4
-
-/**
-  * @brief  TASK-11 - SRP delay-and-sum DOA over the 8 fixed 45-degree directions.
-  *         For each candidate direction, advance every channel by its expected
-  *         integer delay (from g_doa_dly), sum the 8 aligned channels and
-  *         accumulate the beam power.  The steering direction with the largest
-  *         power is the source bearing ("take only the strongest source").
+  * @brief  TASK-11 - table-match DOA. The source is assumed to sit at one of the
+  *         8 fixed 45-degree directions; pick the table row whose expected lags
+  *         best match the 4 measured opposite-pair TDOAs (minimum sum-of-squared
+  *         error). Output azimuth is discrete (0/45/90/.../315).
   *
-  *         contrast = peak power / mean power over all directions (>= 1).
-  *         ~1 means no directional source (diffuse noise); larger = stronger fix.
+  *         *resid is the normalised minimum SSE: 0 = perfect match, larger =
+  *         noisier fix. Also stored in g_doa_err.
   */
-void DOA_SRP(float *az_deg, float *contrast)
+void DOA_Compute(const float *lag_f, float *az_deg, float *resid)
 {
-  float pw_sum = 0.0f;
-  uint32_t best_a = 0U;
-  float    best_p = -1.0f;
-
-  for (uint32_t a = 0U; a < DOA_N_AZ; a++)
-  {
-    float p = 0.0f;
-    for (uint32_t n = DOA_DLY_MAX; n < AUDIO_BLOCK_SAMPLES - DOA_DLY_MAX; n++)
-    {
-      float y = mic_data[0][n];
-      for (uint32_t k = 0U; k < DOA_NPAIRS; k++)
-      {
-        y += mic_data[k + 1U][(int32_t)n + g_doa_dly[a][k]];
-      }
-      p += y * y;
-    }
-    pw_sum += p;
-    if (p > best_p) { best_p = p; best_a = a; }
-  }
-
-  *az_deg   = g_doa_angles[best_a];
-  float avg = pw_sum / (float)DOA_N_AZ;
-  *contrast = (avg > 1e-20f) ? (best_p / avg) : 1.0f;
-}
-
-/**
-  * @brief  TASK-11 - table-search DOA: the source is assumed to sit at one of
-  *         the DOA_N_AZ fixed 45-degree directions; pick the candidate whose
-  *         expected TDOAs best match the measured lags (minimum sum-of-squared
-  *         residuals). Output azimuth is discrete (0/45/90/...).
-  *
-  *         g_doa_err is set to the normalised minimum SSE: 0 = perfect fit
-  *         (source in the array plane), higher = noisier / off-plane source.
-  */
-void DOA_Compute(const float *lag_f, float *az_deg, float *el_deg)
-{
-  /* Compute SSE for each candidate direction, keep the minimum. */
   uint32_t best_a = 0U;
   float    best_e = 1e30f;
   for (uint32_t a = 0U; a < DOA_N_AZ; a++)
@@ -1281,48 +1226,34 @@ void DOA_Compute(const float *lag_f, float *az_deg, float *el_deg)
   }
   *az_deg = g_doa_angles[best_a];
 
-  /* Normalised residual: 0 = perfect table match, 1 = worst-case lag error.
-   * max_lag = Fs * 2R / C (full-aperture TDOA ceiling in samples). */
+  /* Normalised residual: divide by (npairs × max_lag²); max_lag = Fs·2R/C. */
   float max_lag = ((float)AUDIO_FS_HZ * 2.0f * MIC_ARRAY_RADIUS_M) / C_SOUND_MPS;
   float norm_e  = best_e / ((float)DOA_NPAIRS * max_lag * max_lag + 1e-10f);
   g_doa_err = norm_e;
-  /* Map residual to elevation proxy: low residual => source near array plane. */
-  float smag = 1.0f - norm_e;
-  if (smag < 0.0f) { smag = 0.0f; }
-  if (smag > 1.0f) { smag = 1.0f; }
-  *el_deg = acosf(smag) * (180.0f / PI_F);
+  *resid    = norm_e;
 }
 
 /**
-  * @brief  TASK-11 - geometry/solver self-test, independent of the mics. Synthesize
-  *         the lags an in-plane source at DOA_SELFTEST_AZ would produce, then check
-  *         the solver recovers that azimuth (and elevation ~0). Proves the linear
-  *         algebra + mic_pos wiring before trusting live, noisy lags.
+  * @brief  TASK-11 - self-test independent of the mics. Take the table row for
+  *         DOA_SELFTEST_AZ as synthetic "measured" lags and confirm DOA_Compute
+  *         recovers that azimuth with ~zero residual. Proves the table + matcher.
   */
 void DOA_SelfTest(void)
 {
-  float azr = DOA_SELFTEST_AZ * (PI_F / 180.0f);
-  float ux = cosf(azr), uy = sinf(azr);
-  float lag[DOA_NPAIRS];
-  for (uint32_t k = 0U; k < DOA_NPAIRS; k++)
-  {
-    float dx = mic_pos[k + 1U][0] - mic_pos[0][0];
-    float dy = mic_pos[k + 1U][1] - mic_pos[0][1];
-    lag[k] = -((float)AUDIO_FS_HZ / C_SOUND_MPS) * (dx * ux + dy * uy);
-  }
-  float az, el;
-  DOA_Compute(lag, &az, &el);
+  uint32_t idx = (uint32_t)lroundf(DOA_SELFTEST_AZ / DOA_AZ_STEP) % DOA_N_AZ;
+  float az, resid;
+  DOA_Compute(g_doa_table[idx], &az, &resid);
   int32_t azi = (int32_t)lroundf(az);
-  int32_t eli = (int32_t)lroundf(el);
 
   printf("\r\n--- TASK-11 DOA ---\r\n");
-  printf("self-test: az %d -> az %ld el %ld (expected az %d el 0)\r\n",
-         (int)DOA_SELFTEST_AZ, (long)azi, (long)eli, (int)DOA_SELFTEST_AZ);
+  printf("self-test: az %d -> az %ld resid x1000 = %ld (expected az %d)\r\n",
+         (int)DOA_SELFTEST_AZ, (long)azi,
+         (long)lroundf(resid * 1000.0f), (int)DOA_SELFTEST_AZ);
   int32_t derr = azi - (int32_t)DOA_SELFTEST_AZ;
   if (derr < 0) { derr = -derr; }
-  if ((derr <= 2) && (eli <= 2))
+  if ((derr <= 2) && (resid < 0.01f))
   {
-    printf("TASK-11 self-test OK (azimuth within +/-2 deg).\r\n");
+    printf("TASK-11 self-test OK (azimuth exact, residual ~0).\r\n");
   }
   else
   {
@@ -1416,8 +1347,7 @@ void Pipeline_InitOnce(void)
 #if GCC_ENABLE
   GCC_SelfTest();      /* TASK-08: synthetic 5-sample delay -> lag 5 */
 #if DOA_ENABLE
-  DOA_Init();          /* TASK-11: precompute the least-squares pseudo-inverse */
-  DOA_SelfTest();      /* TASK-11: synthetic azimuth -> recovered azimuth */
+  DOA_SelfTest();      /* TASK-11: hardcoded-table azimuth recovery check */
 #endif
 #endif
 #endif
@@ -1481,16 +1411,30 @@ void StartTask02(void *argument)
     FFT_ProcessAll();
 #if GCC_ENABLE
     GCC_ProcessPairs();
-    /* Hand the TDOA + SRP result to DOA_Task (drop if the queue is full). */
+    /* Hand the 4 opposite-pair TDOAs to DOA_Task (drop if the queue is full). */
     tdoa_result_t res;
     res.seq = g_blocks;
     for (uint32_t k = 0U; k < GCC_NPAIRS_LIVE; k++) { res.lag[k] = g_tdoa_lag_f[k]; }
-#if DOA_ENABLE
-    /* SRP delay-and-sum must run here, while mic_data still holds this frame. */
-    DOA_SRP(&res.az, &res.contrast);
-#else
-    res.az = 0.0f; res.contrast = 1.0f;
-#endif
+    /* Frame level for the clap onset gate: ch0 highpassed at 500 Hz, then
+     * sum of squares. The highpass rejects low-frequency room noise (which
+     * dominates the noise floor) so claps - broadband, energy mostly 500-2k Hz
+     * - stand out. Coefficients: 2nd-order Butterworth, Fs=16kHz (from MATLAB
+     * design_clap_hpf.m). Biquad state persists across frames (contiguous DMA). */
+    {
+      static const float HPF_B[3] = {  0.87033078f, -1.74066156f, 0.87033078f };
+      static const float HPF_A[3] = {  1.00000000f, -1.72377617f, 0.75754694f };
+      static float w1 = 0.0f, w2 = 0.0f;     /* transposed direct form II state */
+      float level = 0.0f;
+      for (uint32_t n = 0U; n < AUDIO_BLOCK_SAMPLES; n++)
+      {
+        float in = mic_data[0][n];
+        float yo = HPF_B[0] * in + w1;
+        w1 = HPF_B[1] * in - HPF_A[1] * yo + w2;
+        w2 = HPF_B[2] * in - HPF_A[2] * yo;
+        level += yo * yo;
+      }
+      res.level = level;
+    }
     osMessageQueuePut(result_queueHandle, &res, 0U, 0U);
 #endif
 #endif
@@ -1570,81 +1514,76 @@ void StartTask03(void *argument)
 void StartTask04(void *argument)
 {
   /* USER CODE BEGIN StartTask04 */
-  /* TASK-11: drain the TDOA result queue, solve direction of arrival, and report
-   * azimuth/elevation (degrees) ~once per second. The LED toggles on each printed
-   * fix so a moving source is visible on the board too. */
+  /* TASK-11: drain the TDOA result queue and, once per second, report the
+   * direction of the loudest CLAP so the camera can be steered to it.
+   *
+   * Clap input gate: in a noisy room, steady background noise is everywhere and
+   * would smear the DOA. A clap is an impulsive onset - its frame level jumps
+   * well above the slowly-tracked noise floor. Only such clap frames are voted
+   * on; steady noise keeps updating the floor instead. For each clap frame the
+   * 4 opposite-pair lags are matched to a discrete direction (DOA_Compute) and
+   * that direction gets a vote weighted by match quality (1 - residual). At the
+   * end of each 1-second window the most-voted direction is the cam target. */
   tdoa_result_t res;
-  uint32_t last_print = 0U;
+  uint32_t win_start = 0U;
 
-  /* Sliding median filter over the last DOA_MED_WIN accepted fixes. Raw frames
-   * with el clamped to 0 are front-back ambiguity flips (az mirrors ~180 deg);
-   * they are rejected before the filter. Azimuth is circular, so its median is
-   * the window element minimizing the summed wrap-around angular distance. */
-#define DOA_MED_WIN 7U
-  float az_win[DOA_MED_WIN], el_win[DOA_MED_WIN];
-  uint32_t win_cnt = 0U, win_idx = 0U;
+#define DOA_WIN_BLOCKS 16U             /* ~1 s at 16 blocks/s                   */
+#define DOA_RESID_MAX  0.5f            /* reject frames with no clear delay fit  */
+#define CLAP_RATIO     6.0f            /* clap if level > RATIO x noise floor    */
+#define CLAP_ABS_MIN   0.5f            /* absolute floor so silence never fires  */
+#define CLAP_BG_ALPHA  0.10f           /* noise-floor EMA rate (non-clap frames) */
+  float    vote[DOA_N_AZ] = {0.0f};
+  uint32_t n_acc = 0U;                 /* clap frames accepted this window       */
+  float    bg = CLAP_ABS_MIN;          /* tracked background noise floor (level) */
 
   for (;;)
   {
     if (osMessageQueueGet(result_queueHandle, &res, NULL, portMAX_DELAY) != osOK) { continue; }
 
 #if DOA_ENABLE
-    /* SRP (delay-and-sum) result computed in FFT_Task while the frame was hot.
-     * contrast = peak/mean beam power; ~1 means diffuse noise, no real source. */
-    float az = res.az;
-    float el = 0.0f;
-    g_doa_err = res.contrast;
+    float az, resid;
+    DOA_Compute(res.lag, &az, &resid);     /* discrete az + normalised residual */
 
-    if (res.contrast > 1.2f)               /* reject frames with no clear source */
+    /* Clap onset gate: level must spike above the noise floor (and an absolute
+     * minimum). Non-clap frames just refresh the floor estimate. */
+    uint8_t is_clap = (res.level > CLAP_RATIO * bg) && (res.level > CLAP_ABS_MIN);
+    if (!is_clap)
     {
-      az_win[win_idx] = az;
-      el_win[win_idx] = el;
-      win_idx = (win_idx + 1U) % DOA_MED_WIN;
-      if (win_cnt < DOA_MED_WIN) { win_cnt++; }
-
-      /* circular median of azimuth */
-      float best_az = az, best_cost = 1e30f;
-      for (uint32_t i = 0U; i < win_cnt; i++)
-      {
-        float cost = 0.0f;
-        for (uint32_t j = 0U; j < win_cnt; j++)
-        {
-          float d = fabsf(az_win[i] - az_win[j]);
-          if (d > 180.0f) { d = 360.0f - d; }
-          cost += d;
-        }
-        if (cost < best_cost) { best_cost = cost; best_az = az_win[i]; }
-      }
-
-      /* plain median of elevation (insertion sort on a small copy) */
-      float el_sorted[DOA_MED_WIN];
-      memcpy(el_sorted, el_win, win_cnt * sizeof(float));
-      for (uint32_t i = 1U; i < win_cnt; i++)
-      {
-        float v = el_sorted[i];
-        uint32_t j = i;
-        while ((j > 0U) && (el_sorted[j - 1U] > v)) { el_sorted[j] = el_sorted[j - 1U]; j--; }
-        el_sorted[j] = v;
-      }
-
-      g_doa_az = best_az;
-      g_doa_el = el_sorted[win_cnt / 2U];
+      bg += CLAP_BG_ALPHA * (res.level - bg);   /* EMA track background */
     }
 
-    if (((res.seq - last_print) >= 16U) && (win_cnt > 0U))  /* ~1 Hz at 16 blocks/s */
+    if (is_clap && (resid < DOA_RESID_MAX))
     {
-      last_print = res.seq;
-      az = g_doa_az;                       /* report the filtered fix */
-      (void)el;
-      /* %f is not linked in (newlib-nano, no -u _printf_float); print tenths
-       * using integer math instead. az in [0,360); cs = SRP contrast (>=1). */
-      int32_t az10 = (int32_t)lroundf(az * 10.0f);
-      int32_t cs10 = (int32_t)lroundf(res.contrast * 10.0f);
-      printf("DOA seq=%lu az=%ld.%ld cs=%ld.%ld\r\n",
-             (unsigned long)res.seq,
-             (long)(az10 / 10), (long)(az10 % 10),
-             (long)(cs10 / 10), (long)(cs10 % 10));
-      BSP_LED_Toggle(LED_GREEN);
+      uint32_t idx = (uint32_t)lroundf(az / DOA_AZ_STEP) % DOA_N_AZ;
+      vote[idx] += (1.0f - resid);         /* weight cleaner matches more       */
+      n_acc++;
+    }
+
+    if ((res.seq - win_start) >= DOA_WIN_BLOCKS)   /* 1-second window elapsed    */
+    {
+      win_start = res.seq;
+      if (n_acc > 0U)
+      {
+        /* dominant direction = most-voted over the last second */
+        uint32_t best = 0U;
+        float    best_v = -1.0f;
+        for (uint32_t a = 0U; a < DOA_N_AZ; a++)
+        {
+          if (vote[a] > best_v) { best_v = vote[a]; best = a; }
+        }
+        g_doa_az = g_doa_angles[best];
+        g_doa_el = 0.0f;
+        int32_t azi = (int32_t)lroundf(g_doa_az);
+        printf("DOA seq=%lu az=%ld (cam target, %lu clap frames)\r\n",
+               (unsigned long)res.seq, (long)azi, (unsigned long)n_acc);
+        BSP_LED_Toggle(LED_GREEN);
+      }
+      else
+      {
+        printf("DOA seq=%lu no clap this second\r\n", (unsigned long)res.seq);
+      }
+      for (uint32_t a = 0U; a < DOA_N_AZ; a++) { vote[a] = 0.0f; }
+      n_acc = 0U;
     }
 #else
     if ((res.seq - last_print) >= 16U)
