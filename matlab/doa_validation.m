@@ -31,11 +31,21 @@ mic_x   = R_M * cosd(ANG_DEG);                      % (1×8) m
 mic_y   = R_M * sind(ANG_DEG);
 mic_pos = [mic_x(:), mic_y(:)];                     % (8×2) m
 
-% Pseudo-inverse DOA — mirror STM32 DOA_Init()
-% D[k] = mic_pos[k+1] - mic_pos[0],  k=0..6  →  (7×2)
-% u = M_pinv * (lag_samp * C/Fs)  →  2D direction cosines
-D_mat  = mic_pos(2:end,:) - mic_pos(1,:);           % (7×2)
-M_pinv = (D_mat' * D_mat) \ D_mat';                 % (2×7)
+% Bảng tra TDOA — HARDCODE (mirror STM32 DOA_Init, table-search version)
+% DOA_TABLE(a,k) = lag kỳ vọng (samples) trên baseline k (mic0 vs mic k)
+% cho hướng ứng viên DOA_ANGLES(a).
+% Sinh từ: UCA R=40mm, Fs=16000, C=343 m/s,
+% ANG_DEG = [0 180 45 225 90 270 135 315], công thức (Fs/C)*dot(d_k, u_a).
+DOA_ANGLES = 0:45:315;                              % (1×8)
+DOA_TABLE = [ ...                                   % (8×7)  cột: ch1..ch7
+  -3.731778  -0.546506  -3.185272  -1.865889  -1.865889  -3.185272  -0.546506 ;  % az=0
+  -2.638766   0.546506  -3.185272   0.000000  -2.638766  -1.319383  -1.319383 ;  % az=45
+   0.000000   1.319383  -1.319383   1.865889  -1.865889   1.319383  -1.319383 ;  % az=90
+   2.638766   1.319383   1.319383   2.638766   0.000000   3.185272  -0.546506 ;  % az=135
+   3.731778   0.546506   3.185272   1.865889   1.865889   3.185272   0.546506 ;  % az=180
+   2.638766  -0.546506   3.185272   0.000000   2.638766   1.319383   1.319383 ;  % az=225
+   0.000000  -1.319383   1.319383  -1.865889   1.865889  -1.319383   1.319383 ;  % az=270
+  -2.638766  -1.319383  -1.319383  -2.638766   0.000000  -3.185272   0.546506 ]; % az=315
 
 MAX_TDOA_SAMP = 2 * R_M / C_MPS * Fs;   % max delay = diameter / c
 
@@ -294,13 +304,13 @@ end
 %% =========================================================================
 %  4. DOA Estimation — so sánh với giá trị thực
 % =========================================================================
-[az_est, el_est] = doa_ls(lags_est, M_pinv, Fs, C_MPS);
+[az_est, el_est, err_est] = doa_srp(mic_sig, DOA_TABLE, DOA_ANGLES);
 az_err = mod(az_est - AZ_TRUE + 180, 360) - 180;
 el_err = el_est - EL_TRUE;
 
 fprintf('\n=== DOA result ===\n');
 fprintf('  True :     az = %.3f°   el = %.3f°\n', AZ_TRUE, EL_TRUE);
-fprintf('  Estimated: az = %.3f°   el = %.3f°\n', az_est, el_est);
+fprintf('  Estimated: az = %.3f°   el = %.3f°   (residual err = %.4f)\n', az_est, el_est, err_est);
 fprintf('  Error:     az = %+.3f°  el = %+.3f°\n', az_err, el_err);
 
 % Polar figure
@@ -360,7 +370,7 @@ for ti = 1:length(az_sweep)
     for k = 1:N_PAIRS
         [~, lags_sweep(k)] = gcc_phat(s_t(1,:), s_t(k+1,:), N);
     end
-    [az_out(ti), el_out(ti)] = doa_ls(lags_sweep, M_pinv, Fs, C_MPS);
+    [az_out(ti), el_out(ti)] = doa_srp(s_t, DOA_TABLE, DOA_ANGLES);
 end
 
 az_err_sweep = mod(az_out - az_sweep + 180, 360) - 180;
@@ -424,7 +434,7 @@ for si = 1:length(snr_range)
         end
         lgs=zeros(N_PAIRS,1);
         for k=1:N_PAIRS, [~,lgs(k)]=gcc_phat(s_t(1,:),s_t(k+1,:),N); end
-        [az_r,~]=doa_ls(lgs,M_pinv,Fs,C_MPS);
+        [az_r,~]=doa_srp(s_t,DOA_TABLE,DOA_ANGLES);
         errs(tr)=mod(az_r-45+180,360)-180;
     end
     rms_vs_snr(si)=rms(errs);
@@ -481,12 +491,30 @@ function [corr_shift, lag_samp] = gcc_phat(x, y, N)
 end
 
 
-function [az, el] = doa_ls(lags_samp, M_pinv, Fs, C)
-% Least-squares DOA. Mirror STM32 DOA_Compute().
-    lag_m = double(lags_samp) * C / Fs;   % path diff (m)
-    u     = M_pinv * lag_m(:);            % 2D direction estimate
-    smag  = norm(u);
-    if smag > 1, u = u / smag;  smag = 1; end
-    az = atan2d(u(2), u(1));
-    el = acosd(min(smag, 1.0));
+function [az, el, contrast] = doa_srp(data_f, doa_table, angles_deg)
+% SRP delay-and-sum DOA. Mirror STM32 DOA_SRP().
+% Với mỗi hướng trong 8 hướng 45° cố định: dịch từng kênh theo delay kỳ vọng
+% (làm tròn về số nguyên sample), cộng 8 kênh đã căn chỉnh, lấy công suất chùm.
+% Hướng có công suất LỚN NHẤT là hướng nguồn (chỉ lấy nguồn âm mạnh nhất).
+% contrast = công suất đỉnh / trung bình (>=1); ~1 nghĩa là không có nguồn rõ.
+%
+% Dấu: doa_table chứa lag GCC kỳ vọng (+(Fs/C)·dot(d_k,u)); delay vật lý của
+% kênh k so với kênh 0 là số ÂM của giá trị đó, nên shift = round(-doa_table).
+    [n_ch, N] = size(data_f);
+    n_az  = numel(angles_deg);
+    dmax  = ceil(max(abs(doa_table(:)))) + 1;
+    n_rng = (1 + dmax):(N - dmax);
+    pw    = zeros(n_az, 1);
+    for a = 1:n_az
+        y = data_f(1, n_rng);
+        for k = 1:n_ch-1
+            sh = round(-doa_table(a, k));
+            y  = y + data_f(k+1, n_rng + sh);
+        end
+        pw(a) = sum(y.^2);
+    end
+    [best_p, best_a] = max(pw);
+    az = angles_deg(best_a);
+    contrast = best_p / (mean(pw) + 1e-20);
+    el = 0;                               % SRP phẳng: không ước lượng elevation
 end

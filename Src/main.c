@@ -86,7 +86,8 @@
 #define C_SOUND_MPS          343.0f                       /* speed of sound @ 20 C      */
 #define MIC_ARRAY_RADIUS_M   0.040f                       /* UCA radius = 40 mm         */
 #define DOA_NPAIRS           GCC_NPAIRS_LIVE              /* 7 baselines: mic0 vs 1..7  */
-#define DOA_SELFTEST_AZ      30.0f                        /* synthetic source azimuth   */
+#define DOA_N_AZ             8U                           /* candidate directions (8x45°)*/
+#define DOA_SELFTEST_AZ      45.0f                        /* synthetic source azimuth (must be one of the 8 table directions) */
 
 /* TASK-09: FreeRTOS task notification flags (FFT_Task waits on these). */
 #define FLAG_FFT             (1UL << 0)                   /* a fresh half is ready      */
@@ -98,6 +99,8 @@ typedef struct
 {
   uint32_t seq;                       /* processed-block counter                  */
   float    lag[GCC_NPAIRS_LIVE];      /* mic0 vs mic1..7, fractional samples (TASK-11) */
+  float    az;                        /* SRP delay-and-sum azimuth, degrees (discrete) */
+  float    contrast;                  /* SRP peak power / mean power (>=1)        */
 } tdoa_result_t;
 /* USER CODE END PD */
 
@@ -234,11 +237,15 @@ float    g_tdoa_lag_f[GCC_NPAIRS_LIVE];          /* TASK-11: fractional lags (su
 volatile uint32_t g_gcc_us;                     /* time to compute the live pairs (us) */
 
 #if DOA_ENABLE
-/* TASK-11 DOA state. g_doa_M = precomputed least-squares pseudo-inverse rows so each
- * frame is just 2x7 MACs; g_doa_az/el = last estimate (degrees). */
-float    g_doa_M[2][DOA_NPAIRS];
+/* TASK-11 DOA state.
+ * g_doa_table[a][k]  = expected TDOA lag (samples) for direction a, baseline k.
+ * g_doa_dly[a][k]    = the same lag rounded to integer samples, for delay-and-sum.
+ * g_doa_err = SRP contrast (peak/mean power) of the last fix (higher = stronger). */
+float    g_doa_table[DOA_N_AZ][DOA_NPAIRS];
+int32_t  g_doa_dly[DOA_N_AZ][DOA_NPAIRS];
 volatile float g_doa_az;                         /* azimuth, degrees [0,360)   */
 volatile float g_doa_el;                         /* elevation magnitude, [0,90]*/
+volatile float g_doa_err;                        /* SRP contrast (>=1)         */
 #endif
 #endif
 #endif
@@ -290,6 +297,7 @@ void GCC_ProcessPairs(void);
 #if DOA_ENABLE
 void DOA_Init(void);
 void DOA_Compute(const float *lag_f, float *az_deg, float *el_deg);
+void DOA_SRP(float *az_deg, float *contrast);
 void DOA_SelfTest(void);
 #endif
 #endif
@@ -1177,62 +1185,112 @@ static const float mic_pos[NUM_MIC_CHANNELS][2] = {
 };
 #undef MIC_R
 
+/* Candidate azimuths for the table search (degrees, 8 directions × 45°). */
+static const float g_doa_angles[DOA_N_AZ] = {
+  0.0f, 45.0f, 90.0f, 135.0f, 180.0f, 225.0f, 270.0f, 315.0f
+};
+
 /**
-  * @brief  TASK-11 - precompute the least-squares pseudo-inverse for the DOA solve.
-  *         Far-field plane wave: each baseline d_k = pos[k+1]-pos[0] obeys
-  *         d_k . u = -(C/Fs) * lag_k, with u the unit direction to the source. With
-  *         7 baselines and 2 unknowns (planar array), u = (DtD)^-1 Dt b in the
-  *         least-squares sense. We fold the -(C/Fs) scale into M so that, per frame,
-  *         u = M . lag_f is a plain 2x7 dot product.
+  * @brief  TASK-11 - build TDOA look-up table.
+  *         For each of DOA_N_AZ candidate directions, the expected fractional lag
+  *         on baseline k is:
+  *           table[a][k] = -(Fs/C) * dot(pos[k+1]-pos[0], u_a)
+  *         where u_a = [cos(az_a), sin(az_a)].  At run-time DOA_Compute picks
+  *         the table row whose entries best match the measured lags (min SSE).
   */
 void DOA_Init(void)
 {
-  float D[DOA_NPAIRS][2];
-  for (uint32_t k = 0U; k < DOA_NPAIRS; k++)
+  float scale = -((float)AUDIO_FS_HZ / C_SOUND_MPS);   /* samples per metre */
+  for (uint32_t a = 0U; a < DOA_N_AZ; a++)
   {
-    D[k][0] = mic_pos[k + 1U][0] - mic_pos[0][0];
-    D[k][1] = mic_pos[k + 1U][1] - mic_pos[0][1];
-  }
-  /* DtD = [[a b],[b c]] */
-  float a = 0.0f, b = 0.0f, c = 0.0f;
-  for (uint32_t k = 0U; k < DOA_NPAIRS; k++)
-  {
-    a += D[k][0] * D[k][0];
-    b += D[k][0] * D[k][1];
-    c += D[k][1] * D[k][1];
-  }
-  float det = a * c - b * b;
-  if (fabsf(det) < 1e-18f) { det = 1e-18f; }      /* guard degenerate geometry */
-  float inv00 = c / det, inv01 = -b / det, inv11 = a / det;
-  float scale = -C_SOUND_MPS / (float)AUDIO_FS_HZ;
-  for (uint32_t k = 0U; k < DOA_NPAIRS; k++)
-  {
-    g_doa_M[0][k] = scale * (inv00 * D[k][0] + inv01 * D[k][1]);
-    g_doa_M[1][k] = scale * (inv01 * D[k][0] + inv11 * D[k][1]);
+    float az_r = g_doa_angles[a] * (PI_F / 180.0f);
+    float ux = cosf(az_r), uy = sinf(az_r);
+    for (uint32_t k = 0U; k < DOA_NPAIRS; k++)
+    {
+      float dx = mic_pos[k + 1U][0] - mic_pos[0][0];
+      float dy = mic_pos[k + 1U][1] - mic_pos[0][1];
+      g_doa_table[a][k] = scale * (dx * ux + dy * uy);
+      g_doa_dly[a][k]   = (int32_t)lroundf(g_doa_table[a][k]);
+    }
   }
 }
 
+/* Max |delay| in samples = ceil(Fs * 2R / C); guards the delay-and-sum window. */
+#define DOA_DLY_MAX  4
+
 /**
-  * @brief  TASK-11 - turn the 7 fractional TDOA lags into azimuth + elevation.
-  *         u = M . lag_f gives the in-plane projection of the unit direction; its
-  *         angle is the azimuth and its magnitude is sin(zenith) = cos(elevation),
-  *         so |u|=1 -> source in the array plane, |u|=0 -> overhead. A planar array
-  *         cannot tell above from below the plane, so elevation is a magnitude.
+  * @brief  TASK-11 - SRP delay-and-sum DOA over the 8 fixed 45-degree directions.
+  *         For each candidate direction, advance every channel by its expected
+  *         integer delay (from g_doa_dly), sum the 8 aligned channels and
+  *         accumulate the beam power.  The steering direction with the largest
+  *         power is the source bearing ("take only the strongest source").
+  *
+  *         contrast = peak power / mean power over all directions (>= 1).
+  *         ~1 means no directional source (diffuse noise); larger = stronger fix.
+  */
+void DOA_SRP(float *az_deg, float *contrast)
+{
+  float pw_sum = 0.0f;
+  uint32_t best_a = 0U;
+  float    best_p = -1.0f;
+
+  for (uint32_t a = 0U; a < DOA_N_AZ; a++)
+  {
+    float p = 0.0f;
+    for (uint32_t n = DOA_DLY_MAX; n < AUDIO_BLOCK_SAMPLES - DOA_DLY_MAX; n++)
+    {
+      float y = mic_data[0][n];
+      for (uint32_t k = 0U; k < DOA_NPAIRS; k++)
+      {
+        y += mic_data[k + 1U][(int32_t)n + g_doa_dly[a][k]];
+      }
+      p += y * y;
+    }
+    pw_sum += p;
+    if (p > best_p) { best_p = p; best_a = a; }
+  }
+
+  *az_deg   = g_doa_angles[best_a];
+  float avg = pw_sum / (float)DOA_N_AZ;
+  *contrast = (avg > 1e-20f) ? (best_p / avg) : 1.0f;
+}
+
+/**
+  * @brief  TASK-11 - table-search DOA: the source is assumed to sit at one of
+  *         the DOA_N_AZ fixed 45-degree directions; pick the candidate whose
+  *         expected TDOAs best match the measured lags (minimum sum-of-squared
+  *         residuals). Output azimuth is discrete (0/45/90/...).
+  *
+  *         g_doa_err is set to the normalised minimum SSE: 0 = perfect fit
+  *         (source in the array plane), higher = noisier / off-plane source.
   */
 void DOA_Compute(const float *lag_f, float *az_deg, float *el_deg)
 {
-  float sx = 0.0f, sy = 0.0f;
-  for (uint32_t k = 0U; k < DOA_NPAIRS; k++)
+  /* Compute SSE for each candidate direction, keep the minimum. */
+  uint32_t best_a = 0U;
+  float    best_e = 1e30f;
+  for (uint32_t a = 0U; a < DOA_N_AZ; a++)
   {
-    sx += g_doa_M[0][k] * lag_f[k];
-    sy += g_doa_M[1][k] * lag_f[k];
+    float e = 0.0f;
+    for (uint32_t k = 0U; k < DOA_NPAIRS; k++)
+    {
+      float d = lag_f[k] - g_doa_table[a][k];
+      e += d * d;
+    }
+    if (e < best_e) { best_e = e; best_a = a; }
   }
-  float az = atan2f(sy, sx) * (180.0f / PI_F);
-  if (az < 0.0f) { az += 360.0f; }
-  float smag = sqrtf(sx * sx + sy * sy);
-  if (smag > 1.0f) { smag = 1.0f; }               /* noise can push |u| past 1 */
-  *az_deg = az;
-  *el_deg = acosf(smag) * (180.0f / PI_F);        /* 0 = in-plane, 90 = overhead */
+  *az_deg = g_doa_angles[best_a];
+
+  /* Normalised residual: 0 = perfect table match, 1 = worst-case lag error.
+   * max_lag = Fs * 2R / C (full-aperture TDOA ceiling in samples). */
+  float max_lag = ((float)AUDIO_FS_HZ * 2.0f * MIC_ARRAY_RADIUS_M) / C_SOUND_MPS;
+  float norm_e  = best_e / ((float)DOA_NPAIRS * max_lag * max_lag + 1e-10f);
+  g_doa_err = norm_e;
+  /* Map residual to elevation proxy: low residual => source near array plane. */
+  float smag = 1.0f - norm_e;
+  if (smag < 0.0f) { smag = 0.0f; }
+  if (smag > 1.0f) { smag = 1.0f; }
+  *el_deg = acosf(smag) * (180.0f / PI_F);
 }
 
 /**
@@ -1423,10 +1481,16 @@ void StartTask02(void *argument)
     FFT_ProcessAll();
 #if GCC_ENABLE
     GCC_ProcessPairs();
-    /* Hand the TDOA result to DOA_Task (drop if the queue is full). */
+    /* Hand the TDOA + SRP result to DOA_Task (drop if the queue is full). */
     tdoa_result_t res;
     res.seq = g_blocks;
     for (uint32_t k = 0U; k < GCC_NPAIRS_LIVE; k++) { res.lag[k] = g_tdoa_lag_f[k]; }
+#if DOA_ENABLE
+    /* SRP delay-and-sum must run here, while mic_data still holds this frame. */
+    DOA_SRP(&res.az, &res.contrast);
+#else
+    res.az = 0.0f; res.contrast = 1.0f;
+#endif
     osMessageQueuePut(result_queueHandle, &res, 0U, 0U);
 #endif
 #endif
@@ -1511,27 +1575,75 @@ void StartTask04(void *argument)
    * fix so a moving source is visible on the board too. */
   tdoa_result_t res;
   uint32_t last_print = 0U;
+
+  /* Sliding median filter over the last DOA_MED_WIN accepted fixes. Raw frames
+   * with el clamped to 0 are front-back ambiguity flips (az mirrors ~180 deg);
+   * they are rejected before the filter. Azimuth is circular, so its median is
+   * the window element minimizing the summed wrap-around angular distance. */
+#define DOA_MED_WIN 7U
+  float az_win[DOA_MED_WIN], el_win[DOA_MED_WIN];
+  uint32_t win_cnt = 0U, win_idx = 0U;
+
   for (;;)
   {
     if (osMessageQueueGet(result_queueHandle, &res, NULL, portMAX_DELAY) != osOK) { continue; }
 
 #if DOA_ENABLE
-    float az, el;
-    DOA_Compute(res.lag, &az, &el);
-    g_doa_az = az;
-    g_doa_el = el;
+    /* SRP (delay-and-sum) result computed in FFT_Task while the frame was hot.
+     * contrast = peak/mean beam power; ~1 means diffuse noise, no real source. */
+    float az = res.az;
+    float el = 0.0f;
+    g_doa_err = res.contrast;
 
-    if ((res.seq - last_print) >= 16U)     /* ~1 Hz at 16 blocks/s */
+    if (res.contrast > 1.2f)               /* reject frames with no clear source */
+    {
+      az_win[win_idx] = az;
+      el_win[win_idx] = el;
+      win_idx = (win_idx + 1U) % DOA_MED_WIN;
+      if (win_cnt < DOA_MED_WIN) { win_cnt++; }
+
+      /* circular median of azimuth */
+      float best_az = az, best_cost = 1e30f;
+      for (uint32_t i = 0U; i < win_cnt; i++)
+      {
+        float cost = 0.0f;
+        for (uint32_t j = 0U; j < win_cnt; j++)
+        {
+          float d = fabsf(az_win[i] - az_win[j]);
+          if (d > 180.0f) { d = 360.0f - d; }
+          cost += d;
+        }
+        if (cost < best_cost) { best_cost = cost; best_az = az_win[i]; }
+      }
+
+      /* plain median of elevation (insertion sort on a small copy) */
+      float el_sorted[DOA_MED_WIN];
+      memcpy(el_sorted, el_win, win_cnt * sizeof(float));
+      for (uint32_t i = 1U; i < win_cnt; i++)
+      {
+        float v = el_sorted[i];
+        uint32_t j = i;
+        while ((j > 0U) && (el_sorted[j - 1U] > v)) { el_sorted[j] = el_sorted[j - 1U]; j--; }
+        el_sorted[j] = v;
+      }
+
+      g_doa_az = best_az;
+      g_doa_el = el_sorted[win_cnt / 2U];
+    }
+
+    if (((res.seq - last_print) >= 16U) && (win_cnt > 0U))  /* ~1 Hz at 16 blocks/s */
     {
       last_print = res.seq;
-      /* %f is not linked in (newlib-nano, no -u _printf_float); print tenths of a
-       * degree using integer math instead. az in [0,360), el in [0,90]. */
+      az = g_doa_az;                       /* report the filtered fix */
+      (void)el;
+      /* %f is not linked in (newlib-nano, no -u _printf_float); print tenths
+       * using integer math instead. az in [0,360); cs = SRP contrast (>=1). */
       int32_t az10 = (int32_t)lroundf(az * 10.0f);
-      int32_t el10 = (int32_t)lroundf(el * 10.0f);
-      printf("DOA seq=%lu az=%ld.%ld el=%ld.%ld\r\n",
+      int32_t cs10 = (int32_t)lroundf(res.contrast * 10.0f);
+      printf("DOA seq=%lu az=%ld.%ld cs=%ld.%ld\r\n",
              (unsigned long)res.seq,
              (long)(az10 / 10), (long)(az10 % 10),
-             (long)(el10 / 10), (long)(el10 % 10));
+             (long)(cs10 / 10), (long)(cs10 % 10));
       BSP_LED_Toggle(LED_GREEN);
     }
 #else

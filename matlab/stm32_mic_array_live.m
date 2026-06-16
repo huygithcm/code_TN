@@ -27,6 +27,7 @@ N_SAMP     = 1024;      % samples per channel per frame
 N_CH       = 8;         % mic channels
 R_M        = 0.040;     % UCA radius (m)
 C_MPS      = 343.0;     % speed of sound (m/s)
+CONTRAST_MIN = 1.2;     % SRP contrast gate: below this = no directional source
 MAGIC      = uint8('RAW1');
 HDR_BYTES  = 12;
 PAYLOAD_WORDS = N_CH * N_SAMP;       % int32 words
@@ -53,22 +54,28 @@ mic_x   = R_M * cosd(ang_deg);
 mic_y   = R_M * sind(ang_deg);
 mic_pos = [mic_x(:), mic_y(:)];  % (8×2)
 
-% DOA pseudo-inverse M (mirrors STM32 DOA_Init).
-% D[k] = mic_pos[k+1] - mic_pos[0], k=0..6  → (7×2)
-% u = pinv(D) * (lag_samples × C/Fs)  → 2D unit-direction estimate
-D      = mic_pos(2:end, :) - mic_pos(1, :);   % (7×2)
-M_pinv = (D' * D) \ D';                        % (2×7)
+% DOA look-up table — HARDCODED (mirrors STM32 DOA_Init, table-search version).
+% doa_table(a,k) = expected TDOA lag (samples) on baseline k (mic0 vs mic k)
+% for candidate azimuth DOA_ANGLES(a).
+% Generated for: UCA R=40mm, Fs=16000, C=343 m/s,
+% ang_deg = [0 180 45 225 90 270 135 315], formula (Fs/C)*dot(d_k, u_a).
+DOA_ANGLES = 0:45:315;                          % (1×8) candidate azimuths
+doa_table = [ ...                               % (8×7)  cols: ch1..ch7
+  -3.731778  -0.546506  -3.185272  -1.865889  -1.865889  -3.185272  -0.546506 ;  % az=0
+  -2.638766   0.546506  -3.185272   0.000000  -2.638766  -1.319383  -1.319383 ;  % az=45
+   0.000000   1.319383  -1.319383   1.865889  -1.865889   1.319383  -1.319383 ;  % az=90
+   2.638766   1.319383   1.319383   2.638766   0.000000   3.185272  -0.546506 ;  % az=135
+   3.731778   0.546506   3.185272   1.865889   1.865889   3.185272   0.546506 ;  % az=180
+   2.638766  -0.546506   3.185272   0.000000   2.638766   1.319383   1.319383 ;  % az=225
+   0.000000  -1.319383   1.319383  -1.865889   1.865889  -1.319383   1.319383 ;  % az=270
+  -2.638766  -1.319383  -1.319383  -2.638766   0.000000  -3.185272   0.546506 ]; % az=315
 
 % =========================================================================
 %  Open serial port (skip in sim mode)
 % =========================================================================
 s = [];
 if ~SIM_MODE
-    fprintf('Opening %s  (FRAME_BYTES=%d)...\n', COM_PORT, FRAME_BYTES);
-    s = serialport(COM_PORT, 115200);   % baud ignored by CDC; any value works
-    s.Timeout = 5;
-    flush(s);
-    fprintf('Port open. Streaming...\n');
+    s = open_port(COM_PORT, FRAME_BYTES);
 else
     fprintf('[SIM MODE] Generating synthetic frames.\n');
 end
@@ -222,7 +229,22 @@ while running && ishandle(fig)
     if SIM_MODE
         [frame_data, seq, ok] = sim_frame(frame_cnt, N_CH, N_SAMP, Fs, C_MPS, mic_pos);
     else
-        [frame_data, seq, ok] = read_frame(s, N_CH, N_SAMP, HDR_BYTES, MAGIC);
+        % USB CDC dies whenever the firmware is reflashed (device re-enumerates)
+        % — catch the dead-port error and reconnect instead of crashing.
+        try
+            [frame_data, seq, ok] = read_frame(s, N_CH, N_SAMP, HDR_BYTES, MAGIC, FRAME_BYTES);
+        catch err
+            fprintf('Serial error: %s\nReconnecting %s ...\n', err.message, COM_PORT);
+            ok = false;
+            delete(s);  s = [];
+            pause(2);                       % let the CDC device re-enumerate
+            try
+                s = open_port(COM_PORT, FRAME_BYTES);
+                last_seq = -1;              % seq counter restarts after reset
+            catch
+                fprintf('Reconnect failed — retrying...\n');
+            end
+        end
     end
 
     if ~ok
@@ -254,13 +276,18 @@ while running && ishandle(fig)
         gcc_all(k,:) = gcc_full;
     end
 
-    % --- DOA estimate ----------------------------------------------------
-    [az, el] = doa_from_lags(lags_samp, M_pinv, Fs, C_MPS);
+    % --- DOA estimate (SRP delay-and-sum, strongest source per direction) --
+    [az, ~, contrast] = doa_srp(data_f, doa_table, DOA_ANGLES);
 
-    % --- Update history ---------------------------------------------------
-    hist_ptr = mod(hist_ptr, MAX_HIST) + 1;
-    az_hist(hist_ptr) = az;
-    el_hist(hist_ptr) = el;
+    % --- Source-presence check (mirrors firmware gate contrast > 1.2) -----
+    src_present = contrast > CONTRAST_MIN;
+
+    % --- Update history (only frames with a real source) ------------------
+    if src_present
+        hist_ptr = mod(hist_ptr, MAX_HIST) + 1;
+        az_hist(hist_ptr) = az;
+        el_hist(hist_ptr) = 0;
+    end
 
     % --- Update wavefront lines on array plot ----------------------------
     wf_spacing = R_M * 0.4 * 1e3;   % spacing between wavefront lines (mm)
@@ -272,13 +299,25 @@ while running && ishandle(fig)
         perp_len = 80;
         dx = perp_len * sind(az);
         dy = perp_len * (-cosd(az));
-        set(h_wfront(w), 'XData', [px-dx, px+dx], 'YData', [py-dy, py+dy]);
+        if src_present
+            set(h_wfront(w), 'XData', [px-dx, px+dx], 'YData', [py-dy, py+dy]);
+        else
+            set(h_wfront(w), 'XData', [nan nan], 'YData', [nan nan]);
+        end
     end
 
     % --- Update DOA arrow ------------------------------------------------
     arr_len = 50;   % mm
-    set(h_arrow, 'UData', arr_len*cosd(az), 'VData', arr_len*sind(az));
-    set(h_doatxt, 'String', sprintf('az: %.1f°   el: %.1f°', az, el));
+    if src_present
+        set(h_arrow, 'UData', arr_len*cosd(az), 'VData', arr_len*sind(az), ...
+                     'Color', [1 0.3 0.3]);
+        set(h_doatxt, 'String', sprintf('az: %.0f°   contrast: %.2f', az, contrast), ...
+                      'Color', 'w');
+    else
+        set(h_arrow, 'UData', 0, 'VData', 0);
+        set(h_doatxt, 'String', sprintf('NO SOURCE   contrast: %.2f', contrast), ...
+                      'Color', [0.5 0.5 0.5]);
+    end
 
     % --- Update polar scatter --------------------------------------------
     valid = ~isnan(az_hist);
@@ -336,24 +375,55 @@ end   % main function
 %  Local functions
 % =========================================================================
 
-function [data, seq, ok] = read_frame(s, N_CH, N_SAMP, HDR_BYTES, MAGIC)
+function [data, seq, ok] = read_frame(s, N_CH, N_SAMP, HDR_BYTES, MAGIC, FRAME_BYTES)
 % Read and sync one raw frame from the serial port.
 % Returns data (N_CH×N_SAMP int32), seq, and ok flag.
     data = []; seq = 0; ok = false;
 
-    % Sync: slide 4-byte window until magic matches
-    buf = read(s, 4, 'uint8');
-    for attempt = 1:60000
+    % Drop the backlog if plotting fell behind the 512 KB/s stream — reading
+    % stale data byte-by-byte is what used to stall the CDC link entirely.
+    if s.NumBytesAvailable > 3 * FRAME_BYTES
+        flush(s, 'input');
+    end
+
+    % Sync: bulk-read chunks and scan for the magic (never 1-byte reads).
+    buf = uint8(read(s, 4, 'uint8'));
+    buf = buf(:)';
+    for attempt = 1:30
         if isequal(buf, MAGIC), break; end
-        buf = [buf(2:end), read(s, 1, 'uint8')];
-        if attempt == 60000
-            warning('stm32_mic_array:sync', 'Cannot find magic RAW1 after 60000 bytes.');
+        n     = max(min(double(s.NumBytesAvailable), FRAME_BYTES), 64);
+        chunk = uint8(read(s, n, 'uint8'));
+        win   = [buf, chunk(:)'];
+        k     = strfind(win, MAGIC);
+        if ~isempty(k)
+            % Re-queue everything after the magic is not possible — instead
+            % consume up to the magic and read the rest of this frame below.
+            extra = win(k(1)+4:end);              % bytes already pulled past magic
+            buf   = MAGIC;
+            % Stash the surplus so header/payload reads can use it first.
+            s.UserData = extra;
+            break;
+        end
+        buf = win(end-3:end);
+        if attempt == 30
+            warning('stm32_mic_array:sync', 'Cannot find magic RAW1.');
             return;
         end
     end
+    if ~isequal(buf, MAGIC), return; end
 
-    % Header: 8 remaining bytes (seq + nch + nsamp_lo + nsamp_hi + fmt)
-    hdr   = read(s, HDR_BYTES - 4, 'uint8');
+    % Helper: serve bytes from the surplus stash first, then the port.
+    stash = uint8([]);
+    if ~isempty(s.UserData), stash = uint8(s.UserData(:)'); s.UserData = []; end
+    need  = (HDR_BYTES - 4) + N_CH * N_SAMP * 4;  % header rest + payload bytes
+    if numel(stash) < need
+        more  = uint8(read(s, need - numel(stash), 'uint8'));
+        stash = [stash, more(:)'];
+    end
+    hdr_pl = stash(1:need);
+
+    % Header: 8 bytes (seq + nch + nsamp_lo + nsamp_hi + fmt)
+    hdr   = hdr_pl(1:HDR_BYTES-4);
     % Decode uint32 LE manually — avoids typecast shape ambiguity (row vs col)
     seq   = double(hdr(1)) + double(hdr(2))*256 + ...
             double(hdr(3))*65536 + double(hdr(4))*16777216;
@@ -367,10 +437,10 @@ function [data, seq, ok] = read_frame(s, N_CH, N_SAMP, HDR_BYTES, MAGIC)
         return;
     end
 
-    % Payload: N_CH*N_SAMP int32 values (little-endian, native on x86)
-    raw  = read(s, N_CH * N_SAMP, 'int32');   % (N_CH*N_SAMP × 1)
+    % Payload: N_CH*N_SAMP int32 values (little-endian)
+    raw  = typecast(hdr_pl(HDR_BYTES-4+1:end), 'int32');   % (N_CH*N_SAMP × 1)
     % C layout: row-major [N_CH][N_SAMP] → ch0 first, ch1 next, ...
-    data = reshape(raw, [N_SAMP, N_CH])';      % (N_CH × N_SAMP)
+    data = reshape(double(raw), [N_SAMP, N_CH])';          % (N_CH × N_SAMP)
     ok   = true;
 end
 
@@ -399,15 +469,43 @@ function [corr_shift, lag_samp] = gcc_phat(x, y, N)
 end
 
 
-function [az, el] = doa_from_lags(lags_samp, M_pinv, Fs, C)
-% Least-squares DOA from 7 TDOA lags (mic0 vs mic1..7).
-% Mirrors STM32 DOA_Compute().
-    lag_m = double(lags_samp) * C / Fs;   % (7×1) path-length differences (m)
-    u     = M_pinv * lag_m(:);            % (2×1) direction cosines estimate
-    smag  = norm(u);
-    if smag > 1, u = u / smag; smag = 1; end
-    az = atan2d(u(2), u(1));             % degrees, 0=+x, CCW
-    el = acosd(min(smag, 1.0));          % 0=in-plane, 90=overhead
+function s = open_port(com_port, frame_bytes)
+% Open the USB CDC virtual COM port for the RAW1 stream.
+    fprintf('Opening %s  (FRAME_BYTES=%d)...\n', com_port, frame_bytes);
+    s = serialport(com_port, 115200);   % baud ignored by CDC; any value works
+    s.Timeout = 5;
+    flush(s);
+    fprintf('Port open. Streaming...\n');
+end
+
+
+function [az, el, contrast] = doa_srp(data_f, doa_table, angles_deg)
+% SRP delay-and-sum DOA (mirrors STM32 DOA_SRP).
+% For each of the 8 fixed 45-deg directions, advance each channel by its
+% expected integer delay, sum the aligned channels, and take the beam power.
+% The direction with the largest power wins (only the strongest source).
+% contrast = peak power / mean power (>=1); ~1 means no directional source.
+%
+% Note on sign: doa_table holds the expected GCC lag (+(Fs/C)·dot(d_k,u));
+% the physical delay of ch k vs ch0 is the NEGATIVE of that, so the
+% alignment shift is round(-doa_table).
+    [n_ch, N] = size(data_f);
+    n_az  = numel(angles_deg);
+    dmax  = ceil(max(abs(doa_table(:)))) + 1;
+    n_rng = (1 + dmax):(N - dmax);
+    pw    = zeros(n_az, 1);
+    for a = 1:n_az
+        y = data_f(1, n_rng);
+        for k = 1:n_ch-1
+            sh = round(-doa_table(a, k));
+            y  = y + data_f(k+1, n_rng + sh);
+        end
+        pw(a) = sum(y.^2);
+    end
+    [best_p, best_a] = max(pw);
+    az = angles_deg(best_a);
+    contrast = best_p / (mean(pw) + 1e-20);
+    el = 0;                                   % SRP planar: elevation not estimated
 end
 
 
