@@ -22,7 +22,8 @@
 #include "usbd_cdc_if.h"
 
 /* USER CODE BEGIN INCLUDE */
-
+#include <string.h>
+#include <stdlib.h>
 /* USER CODE END INCLUDE */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -32,6 +33,36 @@
 /* USER CODE BEGIN PV */
 /* Private variables ---------------------------------------------------------*/
 
+/* Runtime clap-gate tunables, defined in main.c. Set from the PC by sending
+ * lines over this CDC port: "SET ratio 3.0", "SET abs 0.15", "SET resid 0.7". */
+extern volatile float   g_clap_ratio;
+extern volatile float   g_clap_abs;
+extern volatile float   g_doa_resid_max;
+extern volatile uint8_t g_cfg_dirty;
+
+/* One command line is assembled here across USB OUT packets. */
+static char    s_cmd_buf[64];
+static uint8_t s_cmd_len = 0U;
+
+/* Parse one complete line "SET <key> <value>" and apply it. */
+static void CDC_ParseCommand(const char *s)
+{
+  if (strncmp(s, "SET ", 4) != 0) { return; }
+  s += 4;
+  while (*s == ' ') { s++; }
+  const char *key = s;
+  while (*s && *s != ' ') { s++; }
+  uint32_t klen = (uint32_t)(s - key);
+  while (*s == ' ') { s++; }
+  if (*s == '\0') { return; }
+  float v = strtof(s, NULL);
+
+  if      (klen == 5U && strncmp(key, "ratio", 5) == 0) { g_clap_ratio    = v; }
+  else if (klen == 3U && strncmp(key, "abs",   3) == 0) { g_clap_abs      = v; }
+  else if (klen == 5U && strncmp(key, "resid", 5) == 0) { g_doa_resid_max = v; }
+  else { return; }
+  g_cfg_dirty = 1U;
+}
 /* USER CODE END PV */
 
 /** @addtogroup STM32_USB_OTG_DEVICE_LIBRARY
@@ -264,6 +295,28 @@ static int8_t CDC_Control_HS(uint8_t cmd, uint8_t* pbuf, uint16_t length)
 static int8_t CDC_Receive_HS(uint8_t* Buf, uint32_t *Len)
 {
   /* USER CODE BEGIN 11 */
+  /* Assemble incoming bytes into command lines and apply "SET ..." commands. */
+  for (uint32_t i = 0U; i < *Len; i++)
+  {
+    char c = (char)Buf[i];
+    if (c == '\n' || c == '\r')
+    {
+      if (s_cmd_len > 0U)
+      {
+        s_cmd_buf[s_cmd_len] = '\0';
+        CDC_ParseCommand(s_cmd_buf);
+        s_cmd_len = 0U;
+      }
+    }
+    else if (s_cmd_len < (sizeof(s_cmd_buf) - 1U))
+    {
+      s_cmd_buf[s_cmd_len++] = c;
+    }
+    else
+    {
+      s_cmd_len = 0U;   /* overflow -> drop the malformed line */
+    }
+  }
   USBD_CDC_SetRxBuffer(&hUsbDeviceHS, &Buf[0]);
   USBD_CDC_ReceivePacket(&hUsbDeviceHS);
   return (USBD_OK);

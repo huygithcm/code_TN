@@ -70,11 +70,12 @@
 
 /* TASK-08: GCC-PHAT time-delay estimation between OPPOSITE mic pairs.
  * Each SAI pair wires two diametrically opposed mics, so the 4 baselines are
- * full-diameter (max aperture) and span 0/45/90/135 deg:
- *   pair0: ch0=0deg  vs ch1=180deg   baseline along 0 deg
- *   pair1: ch2=45deg vs ch3=225deg   baseline along 45 deg
- *   pair2: ch4=90deg vs ch5=270deg   baseline along 90 deg
- *   pair3: ch6=135deg vs ch7=315deg  baseline along 135 deg */
+ * full-diameter (max aperture) and span 0/45/90/135 deg. Real board wiring
+ * (mics numbered CW 1,7,5,3,2,8,6,4; mic n = ch n-1):
+ *   pair0: ch0=0deg   vs ch1=180deg  baseline along 0 deg  (even end @   0deg)
+ *   pair1: ch2=225deg vs ch3=45deg   baseline along 45 deg (even end @ 225deg)
+ *   pair2: ch4=270deg vs ch5=90deg   baseline along 90 deg (even end @ 270deg)
+ *   pair3: ch6=315deg vs ch7=135deg  baseline along 135 deg(even end @ 315deg) */
 #define GCC_ENABLE           1
 #define GCC_SELFTEST_SHIFT   5                            /* synthetic delay -> lag 5   */
 #define GCC_NPAIRS_LIVE      (NUM_MIC_CHANNELS / 2U)      /* 4 opposite-mic pairs       */
@@ -244,6 +245,17 @@ volatile uint32_t g_gcc_us;                     /* time to compute the live pair
 volatile float g_doa_az;                         /* azimuth, degrees [0,360)   */
 volatile float g_doa_el;                         /* unused (planar), kept 0    */
 volatile float g_doa_err;                        /* normalised min residual    */
+
+/* Runtime-tunable clap gate. Settable from the PC over USB CDC with lines like
+ * "SET ratio 3.0" / "SET abs 0.15" / "SET resid 0.7" (parsed in usbd_cdc_if.c).
+ * Defaults are the relaxed/easy-to-trigger values. g_cfg_dirty is raised by the
+ * CDC parser so DOA_Task echoes the new config to the VCP log. */
+volatile float   g_clap_ratio    = 1.8f;         /* clap if level > ratio*floor */
+volatile float   g_clap_abs      = 0.0005f;      /* absolute level floor. Measured
+                                                  * clap level ~0.001-0.005 here,
+                                                  * so 0.15 (old) blocked all claps. */
+volatile float   g_doa_resid_max = 0.7f;         /* reject fits worse than this */
+volatile uint8_t g_cfg_dirty     = 0U;           /* CDC parser -> DOA_Task echo */
 #endif
 #endif
 #endif
@@ -1166,8 +1178,11 @@ void GCC_ProcessPairs(void)
 
 #if DOA_ENABLE
 /* TASK-11: physical mic geometry (UCA diameter 80mm, R = 0.040 m). Each SAI pair
- * wires two diametrically opposed mics, channel-major angles:
- *   ch0=0  ch1=180 | ch2=45 ch3=225 | ch4=90 ch5=270 | ch6=135 ch7=315  (deg)
+ * wires two diametrically opposed mics. The REAL board numbers its mics clockwise
+ * 1,7,5,3,2,8,6,4 (mic n = channel n-1), giving the channel-major angles:
+ *   ch0=0  ch1=180 | ch2=225 ch3=45 | ch4=270 ch5=90 | ch6=315 ch7=135  (deg)
+ * So the "even" channel of each opposite pair sits at phi_k = {0,225,270,315} deg
+ * (was {0,45,90,135} before the wiring was corrected -> pairs 1,2,3 sign-flipped).
  * The geometry is baked into the hardcoded g_doa_table below, so no runtime
  * coordinate array is needed. */
 
@@ -1179,26 +1194,26 @@ static const float g_doa_angles[DOA_N_AZ] = {
 
 /* TASK-11: HARDCODED TDOA table. g_doa_table[a][k] = expected lag (samples) on
  * opposite pair k for a source at azimuth g_doa_angles[a].
- * Pair k = GCC_PHAT(ch[2k], ch[2k+1]); baseline angle phi_k = k*45 deg.
+ * Pair k = GCC_PHAT(ch[2k], ch[2k+1]); baseline angle phi_k = {0,225,270,315} deg.
  * Formula:  lag = (Fs/C) * 2R * cos(az - phi_k),  (Fs/C)*2R = 3.731778 samples.
  * Regenerate if Fs, R, or the pair wiring changes. */
 static const float g_doa_table[DOA_N_AZ][DOA_NPAIRS] = {
-  {   3.731778f,   2.638766f,   0.000000f,  -2.638766f },  /* az=  0.0 */
-  {   3.447714f,   3.447714f,   1.428090f,  -1.428090f },  /* az= 22.5 */
-  {   2.638766f,   3.731778f,   2.638766f,   0.000000f },  /* az= 45.0 */
-  {   1.428090f,   3.447714f,   3.447714f,   1.428090f },  /* az= 67.5 */
-  {   0.000000f,   2.638766f,   3.731778f,   2.638766f },  /* az= 90.0 */
-  {  -1.428090f,   1.428090f,   3.447714f,   3.447714f },  /* az=112.5 */
-  {  -2.638766f,   0.000000f,   2.638766f,   3.731778f },  /* az=135.0 */
-  {  -3.447714f,  -1.428090f,   1.428090f,   3.447714f },  /* az=157.5 */
-  {  -3.731778f,  -2.638766f,   0.000000f,   2.638766f },  /* az=180.0 */
-  {  -3.447714f,  -3.447714f,  -1.428090f,   1.428090f },  /* az=202.5 */
-  {  -2.638766f,  -3.731778f,  -2.638766f,   0.000000f },  /* az=225.0 */
-  {  -1.428090f,  -3.447714f,  -3.447714f,  -1.428090f },  /* az=247.5 */
-  {   0.000000f,  -2.638766f,  -3.731778f,  -2.638766f },  /* az=270.0 */
-  {   1.428090f,  -1.428090f,  -3.447714f,  -3.447714f },  /* az=292.5 */
-  {   2.638766f,   0.000000f,  -2.638766f,  -3.731778f },  /* az=315.0 */
-  {   3.447714f,   1.428090f,  -1.428090f,  -3.447714f },  /* az=337.5 */
+  {   3.731778f,  -2.638766f,   0.000000f,   2.638766f },  /* az=  0.0 */
+  {   3.447714f,  -3.447714f,  -1.428090f,   1.428090f },  /* az= 22.5 */
+  {   2.638766f,  -3.731778f,  -2.638766f,   0.000000f },  /* az= 45.0 */
+  {   1.428090f,  -3.447714f,  -3.447714f,  -1.428090f },  /* az= 67.5 */
+  {   0.000000f,  -2.638766f,  -3.731778f,  -2.638766f },  /* az= 90.0 */
+  {  -1.428090f,  -1.428090f,  -3.447714f,  -3.447714f },  /* az=112.5 */
+  {  -2.638766f,   0.000000f,  -2.638766f,  -3.731778f },  /* az=135.0 */
+  {  -3.447714f,   1.428090f,  -1.428090f,  -3.447714f },  /* az=157.5 */
+  {  -3.731778f,   2.638766f,   0.000000f,  -2.638766f },  /* az=180.0 */
+  {  -3.447714f,   3.447714f,   1.428090f,  -1.428090f },  /* az=202.5 */
+  {  -2.638766f,   3.731778f,   2.638766f,   0.000000f },  /* az=225.0 */
+  {  -1.428090f,   3.447714f,   3.447714f,   1.428090f },  /* az=247.5 */
+  {   0.000000f,   2.638766f,   3.731778f,   2.638766f },  /* az=270.0 */
+  {   1.428090f,   1.428090f,   3.447714f,   3.447714f },  /* az=292.5 */
+  {   2.638766f,   0.000000f,   2.638766f,   3.731778f },  /* az=315.0 */
+  {   3.447714f,  -1.428090f,   1.428090f,   3.447714f },  /* az=337.5 */
 };
 
 /**
@@ -1528,17 +1543,33 @@ void StartTask04(void *argument)
   uint32_t win_start = 0U;
 
 #define DOA_WIN_BLOCKS 16U             /* ~1 s at 16 blocks/s                   */
-#define DOA_RESID_MAX  0.5f            /* reject frames with no clear delay fit  */
-#define CLAP_RATIO     6.0f            /* clap if level > RATIO x noise floor    */
-#define CLAP_ABS_MIN   0.5f            /* absolute floor so silence never fires  */
 #define CLAP_BG_ALPHA  0.10f           /* noise-floor EMA rate (non-clap frames) */
+  /* Clap thresholds are RUNTIME globals (g_clap_ratio/g_clap_abs/g_doa_resid_max),
+   * settable from the PC over USB CDC - see the SET command parser. */
   float    vote[DOA_N_AZ] = {0.0f};
   uint32_t n_acc = 0U;                 /* clap frames accepted this window       */
-  float    bg = CLAP_ABS_MIN;          /* tracked background noise floor (level) */
+  float    bg = g_clap_abs;            /* tracked background noise floor (level) */
+  /* Per-window diagnostics (printed on the "no clap" line to debug the gate). */
+  float    win_peak_ratio = 0.0f;      /* max level/bg seen this window          */
+  float    win_max_lev    = 0.0f;      /* max raw level this window              */
+  float    win_min_resid  = 1.0f;      /* best (lowest) residual this window     */
+  float    win_best_az    = 0.0f;      /* az of the best-fit frame this window   */
 
   for (;;)
   {
     if (osMessageQueueGet(result_queueHandle, &res, NULL, portMAX_DELAY) != osOK) { continue; }
+
+    /* Echo any clap-gate config just changed from the PC (over USB CDC). printf
+     * here (task context) is safe; the CDC parser only sets the dirty flag. Values
+     * are scaled x1000 because the nano printf has no %f. */
+    if (g_cfg_dirty)
+    {
+      g_cfg_dirty = 0U;
+      printf("CFG ratio=%ld abs=%ld resid=%ld (x1000)\r\n",
+             (long)lroundf(g_clap_ratio * 1000.0f),
+             (long)lroundf(g_clap_abs * 1000.0f),
+             (long)lroundf(g_doa_resid_max * 1000.0f));
+    }
 
 #if DOA_ENABLE
     float az, resid;
@@ -1546,13 +1577,21 @@ void StartTask04(void *argument)
 
     /* Clap onset gate: level must spike above the noise floor (and an absolute
      * minimum). Non-clap frames just refresh the floor estimate. */
-    uint8_t is_clap = (res.level > CLAP_RATIO * bg) && (res.level > CLAP_ABS_MIN);
+    uint8_t is_clap = (res.level > g_clap_ratio * bg) && (res.level > g_clap_abs);
     if (!is_clap)
     {
       bg += CLAP_BG_ALPHA * (res.level - bg);   /* EMA track background */
     }
 
-    if (is_clap && (resid < DOA_RESID_MAX))
+    /* Track this window's loudest frame and best fit for the debug print. */
+    {
+      float ratio = (bg > 1e-20f) ? (res.level / bg) : 0.0f;
+      if (ratio > win_peak_ratio)     { win_peak_ratio = ratio; }
+      if (res.level > win_max_lev)    { win_max_lev = res.level; }
+      if (resid < win_min_resid)      { win_min_resid = resid; win_best_az = az; }
+    }
+
+    if (is_clap && (resid < g_doa_resid_max))
     {
       uint32_t idx = (uint32_t)lroundf(az / DOA_AZ_STEP) % DOA_N_AZ;
       vote[idx] += (1.0f - resid);         /* weight cleaner matches more       */
@@ -1580,8 +1619,18 @@ void StartTask04(void *argument)
       }
       else
       {
-        printf("DOA seq=%lu no clap this second\r\n", (unsigned long)res.seq);
+        /* No clap this second, but still report the live RELATIVE direction of the
+         * best-fit frame so the host always has an angle. "live" flags that it was
+         * NOT a confirmed clap. peakRatio/level kept for gate tuning (x1e3 / x1e6). */
+        int32_t azl = (int32_t)lroundf(win_best_az);
+        printf("DOA seq=%lu az=%ld live resid=%ld peakRatio=%ld need=%ld maxLev_u=%ld\r\n",
+               (unsigned long)res.seq, (long)azl,
+               (long)lroundf(win_min_resid  * 1000.0f),
+               (long)lroundf(win_peak_ratio * 1000.0f),
+               (long)lroundf(g_clap_ratio   * 1000.0f),
+               (long)lroundf(win_max_lev * 1000000.0f));
       }
+      win_peak_ratio = 0.0f; win_max_lev = 0.0f; win_min_resid = 1.0f; win_best_az = 0.0f;
       for (uint32_t a = 0U; a < DOA_N_AZ; a++) { vote[a] = 0.0f; }
       n_acc = 0U;
     }
