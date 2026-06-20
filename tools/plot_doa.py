@@ -51,18 +51,23 @@ MICS = [
     (315, 7, 6),   # ch6
 ]
 
-# Offset xoay CHI DUNG KHI VE cac mic (khong dong cham mapping goc DOA cua
-# firmware: mui ten az van theo 0 deg = +x). -90 deg keo mic 1 (firmware 0 deg)
-# xuong day vong tron, tuc huong ve phia nguoi dung ngoi truoc man hinh.
-MIC_DRAW_ROT_DEG = -90.0
+# Offset xoay CHI DUNG KHI VE (ap cho ca mic + mui ten DOA + cham nguon am, hinh
+# van nhat quan; KHONG dong cham quy uoc az/servo). 180 deg dat mic 1 (az 0) vao
+# dung vi tri mic 5 (az 270) tren hinh. Doi gia tri nay de xoay toan bo hinh.
+MIC_DRAW_ROT_DEG = 180.0
 
-# ------------------------------------------------------- mapping az -> goc servo
-# PHAI khop 1:1 voi firmware (main.c Servo_PointToAzimuth):
-#   r = wrap(az - SERVO_AZ_CENTER) in (-180,180];  servo = clamp(90 + DIR*r, 0,180)
-# neutral(90)=mic1(az0); DIR chon phia camera quay. Tren rig nay +1 quay dung
-# huong nguon am that. PHAI bang SERVO_DIR trong main.c.
-SERVO_AZ_CENTER = 0.0      # azimuth ung voi servo 90 deg (chinh dien)
-SERVO_DIR       = -1.0     # +1 / -1 = chieu pan (doi neu bi nguoc)
+# =========================================================================
+# DIRECTION STANDARD  (PHAI khop y het Src/main.c)
+# -------------------------------------------------------------------------
+# Azimuth `az` in [0,360): 0 deg = mic 1 (ch0), tang theo nguoc chieu kim (CCW).
+# Servo in [0,180]:  servo = clamp(90 + SERVO_DIR * wrap(az - SERVO_AZ_CENTER))
+#   SERVO_AZ_CENTER = 0  -> mic 1 (az 0) la FRONT cua camera = servo 90 (neutral)
+#   SERVO_DIR       = -1 -> mic 6 (az 90) = servo 0 ,  mic 5 (az 270) = servo 180
+# Servo 180 deg chi phu nua vong truoc; nguon sau lung (az ~180) kep ve bien.
+# Hai hang nay PHAI bang SERVO_AZ_CENTER / SERVO_DIR trong main.c.
+# =========================================================================
+SERVO_AZ_CENTER = 0.0
+SERVO_DIR       = -1.0
 
 
 def az_to_servo(az_deg):

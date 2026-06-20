@@ -22,7 +22,9 @@ tools/__pycache__/
 debug/*.npy
 debug/*.wav
 debug/*.png
+debug/*.csv
 debug/*_wav/
+debug/saleae_*/
 
 # --- OS / editor ---
 Thumbs.db

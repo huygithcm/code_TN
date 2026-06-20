@@ -274,11 +274,20 @@ volatile uint32_t g_blocks;                     /* processed-block counter (Moni
 volatile uint32_t g_sai_errors;                 /* TASK-12: HW SAI errors (HAL_SAI_ErrorCallback) */
 volatile uint32_t g_sai_err_code;               /* TASK-12: last HAL SAI error code    */
 
-/* Camera-pan servo on PB6 (TIM4_CH1 PWM). The servo sweeps 180 deg; mechanically
- * its 0 deg is aligned to mic 1, which sits at firmware azimuth 0 deg. PWM is the
- * classic 50 Hz hobby-servo frame: 1 us per timer tick, 20 ms period. SERVO_*_US
- * are the pulse widths for the two travel ends - tune to your servo (many 180 deg
- * units want ~500..2500 us; SG90-class often ~600..2400). */
+/* =========================================================================
+ * DIRECTION STANDARD  (single source of truth - mirror in tools/plot_doa.py)
+ * -------------------------------------------------------------------------
+ * Azimuth `az` in [0,360):  0 deg = mic 1 (ch0) direction, increasing CCW.
+ * Mic <-> az (board mics numbered CW 1,7,5,3,2,8,6,4; mic n = ch n-1):
+ *     mic1=0  mic4=45  mic6=90  mic8=135  mic2=180  mic3=225  mic5=270  mic7=315
+ * Servo in [0,180]:   servo = clamp(90 + SERVO_DIR * wrap(az - SERVO_AZ_CENTER))
+ *     SERVO_AZ_CENTER = 0   -> mic 1 (az 0) is the camera FRONT = servo 90 (neutral)
+ *     SERVO_DIR       = -1  -> mic 6 (az 90) = servo 0 ,  mic 5 (az 270) = servo 180
+ * The 180 deg servo only covers the FRONT half-circle; rear sources (az ~180)
+ * clamp to the nearest edge. tools/plot_doa.py MUST use the same two constants.
+ * ========================================================================= */
+
+/* Camera-pan servo on PB6 (TIM4_CH1 PWM, 50 Hz frame: 1 us/tick, 20 ms period). */
 TIM_HandleTypeDef htim4;
 #define SERVO_TIM_PSC     (64U - 1U)     /* 64 MHz / 64  = 1 MHz -> 1 us/tick */
 #define SERVO_TIM_ARR     (20000U - 1U)  /* 20000 us     = 20 ms -> 50 Hz     */
@@ -286,15 +295,8 @@ TIM_HandleTypeDef htim4;
  * Avoids 500/2500 which over-travels the SG90 end-stops (buzz/stall at extremes). */
 #define SERVO_MIN_US      600.0f         /* pulse at servo 0 deg              */
 #define SERVO_MAX_US      2400.0f        /* pulse at servo 180 deg            */
-/* Azimuth->servo mapping. The camera is centred (servo 90 deg) on the FRONT of
- * the array, i.e. azimuth SERVO_AZ_CENTER (0 deg = mic 0/ch0). SERVO_DIR sets the
- * pan direction; flip it to +1 if the camera turns the wrong way. */
-/* neutral(90)=mic1(az0). DIR chooses which physical side the camera pans to.
- * On THIS rig the camera/servo horn is mounted so +1 turns it toward the real
- * source (DIR=-1 gave the right numbers but turned the wrong way). Keep this in
- * sync with SERVO_DIR in tools/plot_doa.py. */
 #define SERVO_AZ_CENTER   0.0f           /* azimuth that maps to servo 90 deg  */
-#define SERVO_DIR         (-1.0f)        /* +1 / -1 = pan sense (fix if mirrored)*/
+#define SERVO_DIR         (-1.0f)        /* pan sense (see DIRECTION STANDARD)  */
 volatile float   g_servo_deg;           /* last commanded servo angle (debug) */
 /* 1 = DOA drives the servo (auto-track sound); 0 = manual only. A manual "SERVO
  * <deg>" command clears this so testing isn't fought by DOA; "AUTO 1" restores. */
@@ -339,7 +341,8 @@ void DOA_SelfTest(void);
 void Pipeline_InitOnce(void);
 /* Servo (camera pan) on PB6 = TIM4_CH1 PWM, 50 Hz. */
 static void MX_TIM4_Init(void);
-void Servo_SetAngle(float deg);           /* deg in [0,180], 0 = mic 1 direction */
+void Servo_SetAngle(float deg);           /* raw servo angle [0,180]; 90 = front  */
+void Servo_MoveTo(float deg);             /* gradual move with per-step delay     */
 void Servo_PointToAzimuth(float az_deg);  /* map DOA azimuth -> servo angle       */
 /* USER CODE END PFP */
 
@@ -380,7 +383,7 @@ static void MX_TIM4_Init(void)
   HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1);
 }
 
-/* Command the servo to an absolute angle in [0,180] deg (0 deg = mic 1). */
+/* Command the servo to an absolute angle in [0,180] deg (90 = front = mic 1). */
 void Servo_SetAngle(float deg)
 {
   if (deg < 0.0f)   { deg = 0.0f; }
@@ -388,6 +391,27 @@ void Servo_SetAngle(float deg)
   float us = SERVO_MIN_US + (SERVO_MAX_US - SERVO_MIN_US) * (deg / 180.0f);
   __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, (uint32_t)lroundf(us));
   g_servo_deg = deg;
+}
+
+/* Move to an angle GRADUALLY: step a few degrees at a time with a short delay so
+ * the servo has time to travel (and the current draw is gentler -> less brown-out).
+ * Blocking via HAL_Delay - fine both before the RTOS (boot) and inside a task. */
+#define SERVO_STEP_DEG   3.0f      /* size of each move step                  */
+#define SERVO_STEP_MS    20U       /* delay per step (~ servo travel speed)   */
+void Servo_MoveTo(float deg)
+{
+  if (deg < 0.0f)   { deg = 0.0f; }
+  if (deg > 180.0f) { deg = 180.0f; }
+  float cur  = g_servo_deg;
+  float step = (deg >= cur) ? SERVO_STEP_DEG : -SERVO_STEP_DEG;
+  while (fabsf(deg - cur) > SERVO_STEP_DEG)
+  {
+    cur += step;
+    Servo_SetAngle(cur);
+    HAL_Delay(SERVO_STEP_MS);
+  }
+  Servo_SetAngle(deg);             /* land exactly on target */
+  HAL_Delay(SERVO_STEP_MS);
 }
 
 /* Point the camera at a DOA azimuth (firmware convention, 0 deg = mic 0/ch0).
@@ -401,7 +425,7 @@ void Servo_PointToAzimuth(float az_deg)
   float r = fmodf(az_deg - SERVO_AZ_CENTER, 360.0f);
   if (r < -180.0f) { r += 360.0f; }
   if (r >  180.0f) { r -= 360.0f; }
-  Servo_SetAngle(90.0f + SERVO_DIR * r);
+  Servo_MoveTo(90.0f + SERVO_DIR * r);   /* xoay tu tu co delay */
 }
 
 /* USER CODE END 0 */
@@ -451,12 +475,23 @@ int main(void)
   MX_SAI2_Init();
   /* USER CODE BEGIN 2 */
   MX_TIM4_Init();              /* camera-pan servo PWM on PB6 */
-  /* Boot self-test sweep: proves the PWM/servo path independent of DOA. If the
-   * camera does NOT visibly move here, the problem is wiring/power/PWM, not the
-   * DOA logic. Runs before the RTOS, so HAL_Delay (SysTick) is valid. */
-  Servo_SetAngle(0.0f);   HAL_Delay(500);
-  Servo_SetAngle(180.0f); HAL_Delay(500);
-  Servo_SetAngle(90.0f);  HAL_Delay(500);   /* park at centre */
+  /* Boot self-test: aim the camera at mic 1 / 4 / 7 in turn (their on-array
+   * azimuths) so their physical directions can be verified. Uses the SAME
+   * az->servo mapping as DOA (Servo_PointToAzimuth), so this also checks the
+   * mapping/orientation. Runs before the RTOS, so HAL_Delay (SysTick) is valid.
+   *   mic 1 -> az   0 -> servo  90 (chinh dien)
+   *   mic 4 -> az  45 -> servo  45
+   *   mic 7 -> az 315 -> servo 135 */
+  static const float k_mic_az[3] = { 0.0f, 45.0f, 315.0f };   /* mic 1, 4, 7 */
+  for (uint32_t r = 0U; r < 2U; r++)                          /* 2 vong */
+  {
+    for (uint32_t i = 0U; i < 3U; i++)
+    {
+      Servo_PointToAzimuth(k_mic_az[i]);
+      HAL_Delay(1000);
+    }
+  }
+  Servo_SetAngle(90.0f);  HAL_Delay(500);   /* park at centre (mic 1) */
   /* USER CODE END 2 */
 
   /* Init scheduler */
