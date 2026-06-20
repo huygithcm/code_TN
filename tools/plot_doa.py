@@ -51,6 +51,30 @@ MICS = [
     (315, 7, 6),   # ch6
 ]
 
+# Offset xoay CHI DUNG KHI VE cac mic (khong dong cham mapping goc DOA cua
+# firmware: mui ten az van theo 0 deg = +x). -90 deg keo mic 1 (firmware 0 deg)
+# xuong day vong tron, tuc huong ve phia nguoi dung ngoi truoc man hinh.
+MIC_DRAW_ROT_DEG = -90.0
+
+# ------------------------------------------------------- mapping az -> goc servo
+# PHAI khop 1:1 voi firmware (main.c Servo_PointToAzimuth):
+#   r = wrap(az - SERVO_AZ_CENTER) in (-180,180];  servo = clamp(90 + DIR*r, 0,180)
+# neutral(90)=mic1(az0); DIR chon phia camera quay. Tren rig nay +1 quay dung
+# huong nguon am that. PHAI bang SERVO_DIR trong main.c.
+SERVO_AZ_CENTER = 0.0      # azimuth ung voi servo 90 deg (chinh dien)
+SERVO_DIR       = -1.0     # +1 / -1 = chieu pan (doi neu bi nguoc)
+
+
+def az_to_servo(az_deg):
+    """Tinh goc servo (0..180) tu azimuth - GIONG HET firmware de doi chieu.
+    Wrap phai trung khop C: r in (-180,180] (180 -> +180, KHONG phai -180)."""
+    r = (az_deg - SERVO_AZ_CENTER) % 360.0      # [0,360)
+    if r > 180.0:
+        r -= 360.0                              # -> (-180,180]
+    servo = 90.0 + SERVO_DIR * r
+    return max(0.0, min(180.0, servo))
+
+
 DOA_RE = re.compile(r"az\s*=\s*(-?\d+(?:\.\d+)?)")
 
 # --------------------------------------------------------------- doc serial VCP
@@ -150,7 +174,7 @@ def build_plot():
     ax.set_ylim(-lim, lim)
     ax.set_aspect("equal")
     ax.set_title("DOA - huong nguon am tren mang mic (UCA 8 mic, R=40mm)")
-    ax.set_xlabel("x (mm)   |   0 deg = +x, CCW duong")
+    ax.set_xlabel("x (mm)   |   az=0 (mic 1) huong xuong, ve phia nguoi dung")
     ax.set_ylabel("y (mm)")
     ax.grid(True, ls=":", alpha=0.4)
 
@@ -158,9 +182,10 @@ def build_plot():
     th = np.linspace(0, 2 * np.pi, 200)
     ax.plot(R * np.cos(th), R * np.sin(th), color="0.7", lw=1)
 
-    # cac mic (nhan = so in tren board thuc)
+    # cac mic (nhan = so in tren board thuc). Chi xoay vi tri VE bang
+    # MIC_DRAW_ROT_DEG de mic 1 huong ve nguoi dung; goc DOA giu nguyen.
     for ang, board, ch in MICS:
-        a = np.radians(ang)
+        a = np.radians(ang + MIC_DRAW_ROT_DEG)
         x, y = R * np.cos(a), R * np.sin(a)
         ax.plot(x, y, "o", color="#1f77b4", ms=12, zorder=3)
         ax.annotate(str(board), (x, y), ha="center", va="center",
@@ -218,7 +243,9 @@ def main():
                 last_demo_ref[0] = time.time()
         az = reader.az
         if az is not None:
-            a = np.radians(az)
+            # Ap cung MIC_DRAW_ROT_DEG nhu khi ve mic, de mui ten chi dung
+            # huong nguon am THUC TE tren hinh (mic 1 huong ve nguoi dung).
+            a = np.radians(az + MIC_DRAW_ROT_DEG)
             tip = (R * 1.25 * np.cos(a), R * 1.25 * np.sin(a))
             arrow.xy = tip
             arrow.set_position((0, 0))
@@ -229,7 +256,9 @@ def main():
             arrow.arrow_patch.set_color(color)
             seq = f" (seq={reader.seq})" if reader.seq is not None else ""
             kind = "live" if live else "CLAP"
-            txt.set_text(f"az: {az:.0f} deg [{kind}]{seq}" + ("  [cu]" if stale else ""))
+            servo = az_to_servo(az)        # cung cong thuc firmware -> doi chieu
+            txt.set_text(f"az: {az:.0f} deg  ->  servo: {servo:.0f} deg [{kind}]{seq}"
+                         + ("  [cu]" if stale else ""))
             txt.set_color(color)
         else:
             # chua co clap nao -> hien nhip song de biet dang ket noi
@@ -246,7 +275,7 @@ def main():
         dets = list(reader.detections)
         if dets:
             cnt = collections.Counter((round(a / 22.5) * 22.5) % 360 for a in dets)
-            angs = np.radians(list(cnt.keys()))
+            angs = np.radians(np.array(list(cnt.keys())) + MIC_DRAW_ROT_DEG)
             rr = R * 1.45
             offs = np.column_stack((rr * np.cos(angs), rr * np.sin(angs)))
             sizes = [40 + 30 * cnt[k] for k in cnt]

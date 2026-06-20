@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-doa_filter_gui.py - Chinh nguong clap-gate cua DOA bang NUT NHAN / THANH TRUOT.
+doa_filter_gui.py - Chinh clap-gate DOA + TEST SERVO bang NUT NHAN / THANH TRUOT.
 
-Thay cho set_doa_filter.py (CLI). Gui lenh "SET ratio/abs/resid <v>" toi board
-qua cong USB CDC (VID 0483 PID 5740). Firmware xac nhan bang dong "CFG ..." tren
-cong VCP (xem plot_doa.py).
+Gui toi board qua cong USB CDC (VID 0483 PID 5740):
+  - "SET ratio/abs/resid <v>" : chinh nguong clap-gate (firmware bao "CFG ..." VCP).
+  - "SERVO <deg>"             : xoay servo camera truc tiep (test, doc lap DOA).
+Muc "Servo camera": keo thanh truot / bam nut goc nhanh / "Quet test" sweep 0<->180
+de kiem tra servo co di dung goc & giu yen khong (xem servo_test.py cho ban CLI).
 
 Cai dat:  pip install pyserial      (tkinter co san trong Python)
 
@@ -81,9 +83,40 @@ class App:
             ttk.Button(br, text=name,
                        command=lambda n=name: self.apply_preset(n)).pack(side="left", padx=3)
 
+        # --- muc test servo (lenh "SERVO <deg>", doc lap DOA) ---
+        ttk.Separator(frm, orient="horizontal").grid(
+            row=len(PARAMS) + 2, column=0, columnspan=4, sticky="we", pady=8)
+        ttk.Label(frm, text="Servo camera (deg)").grid(
+            row=len(PARAMS) + 3, column=0, sticky="w")
+        self.servo_var = tk.DoubleVar(value=90.0)
+        self.sweeping = False
+        self._sweep_dir = 1
+        tk.Scale(frm, from_=0, to=180, resolution=1, orient="horizontal", length=240,
+                 variable=self.servo_var, showvalue=False,
+                 command=lambda _v: self._on_servo_slide()).grid(
+                     row=len(PARAMS) + 3, column=1, padx=6)
+        self.servo_lbl = ttk.Label(frm, text="90", width=8)
+        self.servo_lbl.grid(row=len(PARAMS) + 3, column=2, sticky="e")
+        ttk.Button(frm, text="Gui", width=5, command=self.send_servo).grid(
+            row=len(PARAMS) + 3, column=3, padx=4)
+
+        sb = ttk.Frame(frm)
+        sb.grid(row=len(PARAMS) + 4, column=0, columnspan=4, sticky="we", pady=(6, 0))
+        for a in (0, 45, 90, 135, 180):
+            ttk.Button(sb, text=f"{a}", width=4,
+                       command=lambda x=a: self.goto_servo(x)).pack(side="left", padx=2)
+        self.sweep_btn = ttk.Button(sb, text="Quet test", command=self.toggle_sweep)
+        self.sweep_btn.pack(side="left", padx=(12, 0))
+
+        # cong tac: servo tu xoay theo nguon am (AUTO) hay chi dieu khien tay
+        self.auto_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(frm, text="Xoay theo nguon am (AUTO)", variable=self.auto_var,
+                        command=self.send_auto).grid(
+                            row=len(PARAMS) + 5, column=0, columnspan=4, sticky="w", pady=(8, 0))
+
         self.status = tk.StringVar(value="Chua ket noi.")
         ttk.Label(frm, textvariable=self.status, foreground="gray").grid(
-            row=len(PARAMS) + 2, column=0, columnspan=4, sticky="w", pady=(6, 0))
+            row=len(PARAMS) + 6, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
         self.connect()
 
@@ -110,9 +143,20 @@ class App:
         try:
             self.sp = serial.Serial(port, 115200, timeout=1)
             self.status.set(f"Da ket noi {port}. Keo thanh truot roi bam 'Gui'.")
+            self._drain()   # bat dau xa stream nhi phan de cong khong nghen
         except Exception as e:
             self.sp = None
             self.status.set(f"Loi mo {port}: {e}")
+
+    def _drain(self):
+        """Cong CDC xoi du lieu mic (RAW1...) lien tuc; neu khong doc, buffer day se
+        chan lenh gui. Dinh ky vut bo input de giu cong thong."""
+        if self.sp:
+            try:
+                self.sp.reset_input_buffer()
+            except Exception:
+                pass
+            self.root.after(200, self._drain)
 
     def _write(self, cmds):
         if not self.sp:
@@ -144,6 +188,44 @@ class App:
             self.vars[k].set(v)
             self._refresh_label(k)
         self.send_all()
+
+    # ---- servo ----
+    def _on_servo_slide(self):
+        self.servo_lbl.config(text=f"{self.servo_var.get():.0f}")
+
+    def send_auto(self):
+        self._write([f"AUTO {1 if self.auto_var.get() else 0}"])
+
+    def send_servo(self):
+        # dieu khien tay -> firmware tu tat AUTO; dong bo lai checkbox
+        self.auto_var.set(False)
+        self._write([f"SERVO {self.servo_var.get():.0f}"])
+
+    def goto_servo(self, deg):
+        self.servo_var.set(deg)
+        self._on_servo_slide()
+        self.send_servo()
+
+    def toggle_sweep(self):
+        self.sweeping = not self.sweeping
+        if self.sweeping:
+            self.sweep_btn.config(text="Dung")
+            self._sweep_tick()
+        else:
+            self.sweep_btn.config(text="Quet test")
+
+    def _sweep_tick(self):
+        if not self.sweeping:
+            return
+        v = self.servo_var.get() + self._sweep_dir * 5
+        if v >= 180:
+            v, self._sweep_dir = 180, -1
+        elif v <= 0:
+            v, self._sweep_dir = 0, 1
+        self.servo_var.set(v)
+        self._on_servo_slide()
+        self.send_servo()
+        self.root.after(40, self._sweep_tick)   # ~quet muot, khong block GUI
 
 
 def main():

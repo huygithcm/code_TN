@@ -40,13 +40,29 @@ extern volatile float   g_clap_abs;
 extern volatile float   g_doa_resid_max;
 extern volatile uint8_t g_cfg_dirty;
 
+/* Manual servo command (debug): "SERVO 45" aims the camera at 45 deg directly,
+ * bypassing DOA. "AUTO 0"/"AUTO 1" stops/resumes DOA driving the servo. */
+extern void Servo_SetAngle(float deg);
+extern volatile uint8_t g_servo_auto;
+
 /* One command line is assembled here across USB OUT packets. */
 static char    s_cmd_buf[64];
 static uint8_t s_cmd_len = 0U;
 
-/* Parse one complete line "SET <key> <value>" and apply it. */
+/* Parse one complete line. Supports "SET <key> <value>" and "SERVO <deg>". */
 static void CDC_ParseCommand(const char *s)
 {
+  if (strncmp(s, "SERVO ", 6) == 0)
+  {
+    g_servo_auto = 0U;                 /* manual test: stop DOA from moving servo */
+    Servo_SetAngle(strtof(s + 6, NULL));
+    return;
+  }
+  if (strncmp(s, "AUTO ", 5) == 0)
+  {
+    g_servo_auto = (uint8_t)(strtol(s + 5, NULL, 10) != 0);
+    return;
+  }
   if (strncmp(s, "SET ", 4) != 0) { return; }
   s += 4;
   while (*s == ' ') { s++; }
@@ -188,6 +204,9 @@ static int8_t CDC_Init_HS(void)
   /* Set Application Buffers */
   USBD_CDC_SetTxBuffer(&hUsbDeviceHS, UserTxBufferHS, 0);
   USBD_CDC_SetRxBuffer(&hUsbDeviceHS, UserRxBufferHS);
+  /* Arm the OUT endpoint so host->device data (SET/SERVO commands) is received.
+   * Without this, CDC_Receive_HS never fires and all commands are dropped. */
+  USBD_CDC_ReceivePacket(&hUsbDeviceHS);
   return (USBD_OK);
   /* USER CODE END 8 */
 }

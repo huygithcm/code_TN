@@ -273,6 +273,32 @@ volatile uint8_t g_usb_snapshot_valid;
 volatile uint32_t g_blocks;                     /* processed-block counter (Monitor)  */
 volatile uint32_t g_sai_errors;                 /* TASK-12: HW SAI errors (HAL_SAI_ErrorCallback) */
 volatile uint32_t g_sai_err_code;               /* TASK-12: last HAL SAI error code    */
+
+/* Camera-pan servo on PB6 (TIM4_CH1 PWM). The servo sweeps 180 deg; mechanically
+ * its 0 deg is aligned to mic 1, which sits at firmware azimuth 0 deg. PWM is the
+ * classic 50 Hz hobby-servo frame: 1 us per timer tick, 20 ms period. SERVO_*_US
+ * are the pulse widths for the two travel ends - tune to your servo (many 180 deg
+ * units want ~500..2500 us; SG90-class often ~600..2400). */
+TIM_HandleTypeDef htim4;
+#define SERVO_TIM_PSC     (64U - 1U)     /* 64 MHz / 64  = 1 MHz -> 1 us/tick */
+#define SERVO_TIM_ARR     (20000U - 1U)  /* 20000 us     = 20 ms -> 50 Hz     */
+/* SG90 (180 deg): pulse 600..2400 us, symmetric about 1500 us (neutral = 90 deg).
+ * Avoids 500/2500 which over-travels the SG90 end-stops (buzz/stall at extremes). */
+#define SERVO_MIN_US      600.0f         /* pulse at servo 0 deg              */
+#define SERVO_MAX_US      2400.0f        /* pulse at servo 180 deg            */
+/* Azimuth->servo mapping. The camera is centred (servo 90 deg) on the FRONT of
+ * the array, i.e. azimuth SERVO_AZ_CENTER (0 deg = mic 0/ch0). SERVO_DIR sets the
+ * pan direction; flip it to +1 if the camera turns the wrong way. */
+/* neutral(90)=mic1(az0). DIR chooses which physical side the camera pans to.
+ * On THIS rig the camera/servo horn is mounted so +1 turns it toward the real
+ * source (DIR=-1 gave the right numbers but turned the wrong way). Keep this in
+ * sync with SERVO_DIR in tools/plot_doa.py. */
+#define SERVO_AZ_CENTER   0.0f           /* azimuth that maps to servo 90 deg  */
+#define SERVO_DIR         (-1.0f)        /* +1 / -1 = pan sense (fix if mirrored)*/
+volatile float   g_servo_deg;           /* last commanded servo angle (debug) */
+/* 1 = DOA drives the servo (auto-track sound); 0 = manual only. A manual "SERVO
+ * <deg>" command clears this so testing isn't fought by DOA; "AUTO 1" restores. */
+volatile uint8_t g_servo_auto = 1U;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -311,10 +337,72 @@ void DOA_SelfTest(void);
 #endif
 #endif
 void Pipeline_InitOnce(void);
+/* Servo (camera pan) on PB6 = TIM4_CH1 PWM, 50 Hz. */
+static void MX_TIM4_Init(void);
+void Servo_SetAngle(float deg);           /* deg in [0,180], 0 = mic 1 direction */
+void Servo_PointToAzimuth(float az_deg);  /* map DOA azimuth -> servo angle       */
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+/* Bring up TIM4_CH1 as a 50 Hz PWM on PB6 to drive the camera-pan servo.
+ * Self-contained (no CubeMX MspInit): enables GPIOB+TIM4 clocks and sets PB6 to
+ * AF2 (TIM4_CH1). 1 us tick, 20 ms frame; duty is set later in micro-seconds. */
+static void MX_TIM4_Init(void)
+{
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_TIM4_CLK_ENABLE();
+
+  GPIO_InitTypeDef gpio = {0};
+  gpio.Pin       = GPIO_PIN_6;
+  gpio.Mode      = GPIO_MODE_AF_PP;
+  gpio.Pull      = GPIO_NOPULL;
+  gpio.Speed     = GPIO_SPEED_FREQ_LOW;
+  gpio.Alternate = GPIO_AF2_TIM4;
+  HAL_GPIO_Init(GPIOB, &gpio);
+
+  htim4.Instance           = TIM4;
+  htim4.Init.Prescaler     = SERVO_TIM_PSC;
+  htim4.Init.CounterMode   = TIM_COUNTERMODE_UP;
+  htim4.Init.Period        = SERVO_TIM_ARR;
+  htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  if (HAL_TIM_PWM_Init(&htim4) != HAL_OK) { Error_Handler(); }
+
+  TIM_OC_InitTypeDef oc = {0};
+  oc.OCMode     = TIM_OCMODE_PWM1;
+  oc.Pulse      = 1500U;                 /* ~centre until first command */
+  oc.OCPolarity = TIM_OCPOLARITY_HIGH;
+  oc.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim4, &oc, TIM_CHANNEL_1) != HAL_OK) { Error_Handler(); }
+
+  HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1);
+}
+
+/* Command the servo to an absolute angle in [0,180] deg (0 deg = mic 1). */
+void Servo_SetAngle(float deg)
+{
+  if (deg < 0.0f)   { deg = 0.0f; }
+  if (deg > 180.0f) { deg = 180.0f; }
+  float us = SERVO_MIN_US + (SERVO_MAX_US - SERVO_MIN_US) * (deg / 180.0f);
+  __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, (uint32_t)lroundf(us));
+  g_servo_deg = deg;
+}
+
+/* Point the camera at a DOA azimuth (firmware convention, 0 deg = mic 0/ch0).
+ * The camera looks straight ahead (servo 90 deg) at SERVO_AZ_CENTER and pans left/
+ * right with SERVO_DIR. The servo only spans 180 deg, so sources in the rear
+ * hemisphere clamp to the nearest reachable edge (handled by Servo_SetAngle).
+ *   r  = signed bearing off centre, in (-180,180]
+ *   servo = 90 + SERVO_DIR * r   (e.g. az 0 -> 90, az 90 -> 0, az 270 -> 180) */
+void Servo_PointToAzimuth(float az_deg)
+{
+  float r = fmodf(az_deg - SERVO_AZ_CENTER, 360.0f);
+  if (r < -180.0f) { r += 360.0f; }
+  if (r >  180.0f) { r -= 360.0f; }
+  Servo_SetAngle(90.0f + SERVO_DIR * r);
+}
 
 /* USER CODE END 0 */
 
@@ -362,7 +450,13 @@ int main(void)
   MX_SAI1_Init();
   MX_SAI2_Init();
   /* USER CODE BEGIN 2 */
-
+  MX_TIM4_Init();              /* camera-pan servo PWM on PB6 */
+  /* Boot self-test sweep: proves the PWM/servo path independent of DOA. If the
+   * camera does NOT visibly move here, the problem is wiring/power/PWM, not the
+   * DOA logic. Runs before the RTOS, so HAL_Delay (SysTick) is valid. */
+  Servo_SetAngle(0.0f);   HAL_Delay(500);
+  Servo_SetAngle(180.0f); HAL_Delay(500);
+  Servo_SetAngle(90.0f);  HAL_Delay(500);   /* park at centre */
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -1612,9 +1706,11 @@ void StartTask04(void *argument)
         }
         g_doa_az = g_doa_angles[best];
         g_doa_el = 0.0f;
+        if (g_servo_auto) { Servo_PointToAzimuth(g_doa_az); }   /* aim camera (unless manual test) */
         int32_t azi = (int32_t)lroundf(g_doa_az);
-        printf("DOA seq=%lu az=%ld (cam target, %lu clap frames)\r\n",
-               (unsigned long)res.seq, (long)azi, (unsigned long)n_acc);
+        printf("DOA seq=%lu az=%ld (cam target, servo=%ld, %lu clap frames)\r\n",
+               (unsigned long)res.seq, (long)azi,
+               (long)lroundf(g_servo_deg), (unsigned long)n_acc);
         BSP_LED_Toggle(LED_GREEN);
       }
       else
