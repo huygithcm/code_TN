@@ -70,12 +70,13 @@
 
 /* TASK-08: GCC-PHAT time-delay estimation between OPPOSITE mic pairs.
  * Each SAI pair wires two diametrically opposed mics, so the 4 baselines are
- * full-diameter (max aperture) and span 0/45/90/135 deg. Real board wiring
- * (mics numbered CW 1,7,5,3,2,8,6,4; mic n = ch n-1):
- *   pair0: ch0=0deg   vs ch1=180deg  baseline along 0 deg  (even end @   0deg)
- *   pair1: ch2=225deg vs ch3=45deg   baseline along 45 deg (even end @ 225deg)
- *   pair2: ch4=270deg vs ch5=90deg   baseline along 90 deg (even end @ 270deg)
- *   pair3: ch6=315deg vs ch7=135deg  baseline along 135 deg(even end @ 315deg) */
+ * full-diameter (max aperture) and span 0/45/90/135 deg. After MIC_REMAP puts
+ * mic_data in clean label order (Mic1..Mic8), the pairs read cleanly:
+ *   pair0: slot0=Mic1(0deg)   vs slot1=Mic2(180deg)  baseline phi_0 = 0 deg
+ *   pair1: slot2=Mic3(45deg)  vs slot3=Mic4(225deg)  baseline phi_1 = 45 deg
+ *   pair2: slot4=Mic5(90deg)  vs slot5=Mic6(270deg)  baseline phi_2 = 90 deg
+ *   pair3: slot6=Mic7(135deg) vs slot7=Mic8(315deg)  baseline phi_3 = 135 deg
+ * (Hardware capture order differs; the remap absorbs it - see Deinterleave_Pair.) */
 #define GCC_ENABLE           1
 #define GCC_SELFTEST_SHIFT   5                            /* synthetic delay -> lag 5   */
 #define GCC_NPAIRS_LIVE      (NUM_MIC_CHANNELS / 2U)      /* 4 opposite-mic pairs       */
@@ -295,7 +296,9 @@ TIM_HandleTypeDef htim4;
  * Avoids 500/2500 which over-travels the SG90 end-stops (buzz/stall at extremes). */
 #define SERVO_MIN_US      600.0f         /* pulse at servo 0 deg              */
 #define SERVO_MAX_US      2400.0f        /* pulse at servo 180 deg            */
-#define SERVO_AZ_CENTER   0.0f           /* azimuth that maps to servo 90 deg  */
+/* Measured on the real rig: servo 0->Mic6(az270), 90->Mic2(az180), 180->Mic5(az90).
+ * => camera neutral (servo 90) faces az 180 (Mic2); servo = 90 - wrap(az-180). */
+#define SERVO_AZ_CENTER   180.0f         /* azimuth that maps to servo 90 deg  */
 #define SERVO_DIR         (-1.0f)        /* pan sense (see DIRECTION STANDARD)  */
 volatile float   g_servo_deg;           /* last commanded servo angle (debug) */
 /* 1 = DOA drives the servo (auto-track sound); 0 = manual only. A manual "SERVO
@@ -475,14 +478,14 @@ int main(void)
   MX_SAI2_Init();
   /* USER CODE BEGIN 2 */
   MX_TIM4_Init();              /* camera-pan servo PWM on PB6 */
-  /* Boot self-test: aim the camera at mic 1 / 4 / 7 in turn (their on-array
-   * azimuths) so their physical directions can be verified. Uses the SAME
-   * az->servo mapping as DOA (Servo_PointToAzimuth), so this also checks the
-   * mapping/orientation. Runs before the RTOS, so HAL_Delay (SysTick) is valid.
-   *   mic 1 -> az   0 -> servo  90 (chinh dien)
-   *   mic 4 -> az  45 -> servo  45
-   *   mic 7 -> az 315 -> servo 135 */
-  static const float k_mic_az[3] = { 0.0f, 45.0f, 315.0f };   /* mic 1, 4, 7 */
+  /* Boot self-test: sweep the camera across its full reachable range so the
+   * physical orientation can be verified. Uses the SAME az->servo mapping as DOA
+   * (Servo_PointToAzimuth). Runs before the RTOS, so HAL_Delay (SysTick) is valid.
+   * Measured mapping (SERVO_AZ_CENTER=180):
+   *   Mic6 -> az 270 -> servo   0
+   *   Mic2 -> az 180 -> servo  90 (chinh dien camera)
+   *   Mic5 -> az  90 -> servo 180 */
+  static const float k_mic_az[3] = { 270.0f, 180.0f, 90.0f };  /* Mic6, Mic2, Mic5 */
   for (uint32_t r = 0U; r < 2U; r++)                          /* 2 vong */
   {
     for (uint32_t i = 0U; i < 3U; i++)
@@ -1033,27 +1036,43 @@ void HAL_SAI_RxCpltCallback(SAI_HandleTypeDef *hsai)
   if (p == 0U) { Audio_NotifyHalfReady(1U); }   /* master block, PONG */
 }
 
+/* TASK-11: channel remap (capture order -> clean logical mic order).
+ * The board is wired so the captured SAI channels land out of order vs the
+ * physical mic labels in the docs (Mic1..Mic8 at 0/180/45/225/90/270/135/315 deg).
+ * Rather than baking that scramble into g_doa_table, we fix it ONCE here at copy
+ * time so the rest of the pipeline sees clean pairs and the table uses the natural
+ * baselines phi_k = {0,45,90,135}. MIC_REMAP[capture_ch] = logical mic slot.
+ * Calibrated by tapping each physical mic and reading tools/test_mic_order.py.
+ * Measured board wiring (physical angle -> capture channel):
+ *   0=ch0  45=ch6  90=ch4  135=ch2  180=ch1  225=ch7  270=ch5  315=ch3.
+ * Each capture ch routed to the slot whose pair-angle matches:
+ *   ch0->0  ch1->1  ch2->6  ch3->7  ch4->4  ch5->5  ch6->2  ch7->3
+ * (Re-run the test if the board is re-wired; only this array needs editing.) */
+static const uint8_t MIC_REMAP[NUM_MIC_CHANNELS] = { 0U, 1U, 6U, 7U, 4U, 5U, 2U, 3U };
+
 /* Deinterleave one stereo pair's half-buffer into the two per-mic arrays.
  * SAI 24-bit data is MSB-left-justified in a 32-bit slot, so the signed 24-bit
  * sample is (word >> 8); /2^23 normalizes to [-1,1]. */
 static void Deinterleave_Pair(uint32_t off, uint8_t pair)
 {
   const int32_t *src = &dma_buf[pair][off];
-  uint8_t l = (uint8_t)(pair * 2U);
+  uint8_t l = (uint8_t)(pair * 2U);            /* capture channels (DMA order) */
   uint8_t r = (uint8_t)(pair * 2U + 1U);
-  /* Mics on ch3 (SAI1-B slot 1) and ch6 (SAI2-B slot 0) are wired with
-   * inverted polarity; negate to restore phase alignment with the other
-   * channels (needed for GCC-PHAT). */
+  uint8_t ld = MIC_REMAP[l];                   /* destination = clean Mic slot */
+  uint8_t rd = MIC_REMAP[r];
+  /* Polarity inversion is a property of the PHYSICAL capture channel: mics on
+   * ch3 (SAI1-B slot 1) and ch6 (SAI2-B slot 0) are wired inverted; negate to
+   * restore phase alignment (needed for GCC-PHAT). Keyed on capture ch, not slot. */
   const int32_t l_sign = (l == 6U) ? -1 : 1;
   const int32_t r_sign = (r == 3U) ? -1 : 1;
   for (uint32_t i = 0U; i < AUDIO_BLOCK_SAMPLES; i++)
   {
     int32_t rl = l_sign * (int32_t)(int16_t)(src[2U * i] & 0xFFFF);
     int32_t rr = r_sign * (int32_t)(int16_t)(src[2U * i + 1U] & 0xFFFF);
-    mic_raw[l][i]  = rl;
-    mic_raw[r][i]  = rr;
-    mic_data[l][i] = (float)rl * (1.0f / 8388608.0f);
-    mic_data[r][i] = (float)rr * (1.0f / 8388608.0f);
+    mic_raw[ld][i]  = rl;
+    mic_raw[rd][i]  = rr;
+    mic_data[ld][i] = (float)rl * (1.0f / 8388608.0f);
+    mic_data[rd][i] = (float)rr * (1.0f / 8388608.0f);
   }
 }
 
@@ -1063,6 +1082,7 @@ static void Deinterleave_Pair(uint32_t off, uint8_t pair)
   *         (master) begins generating SCK/FS.
   * @retval None
   */
+ // khai báo DMA buffer, khởi tạo các biến đếm và trạng thái, sau đó bắt đầu nhận dữ liệu từ các khối SAI bằng DMA. Các khối slave được kích hoạt trước, khối master (SAI1_A) được kích hoạt cuối cùng.
 void Audio_Start(void)
 {
   memset((void *)dma_half_cnt, 0, sizeof(dma_half_cnt));
@@ -1111,6 +1131,7 @@ static uint32_t FFT_PeakBin(const float *mag, float *peakVal)
   *         Reads mic_data[m][] (float, normalized), writes fft_mag[m][0..511].
   *         Times the whole 8-mic pass with the DWT cycle counter.
   */
+ // tính fft 1024 điểm cho tất cả 8 micro, áp dụng cửa sổ Hann, thực hiện FFT thực và tính độ lớn. Đo thời gian thực hiện bằng bộ đếm chu kỳ DWT.
 void FFT_ProcessAll(void)
 {
   uint32_t t0 = DWT->CYCCNT;
@@ -1307,13 +1328,12 @@ void GCC_ProcessPairs(void)
 
 #if DOA_ENABLE
 /* TASK-11: physical mic geometry (UCA diameter 80mm, R = 0.040 m). Each SAI pair
- * wires two diametrically opposed mics. The REAL board numbers its mics clockwise
- * 1,7,5,3,2,8,6,4 (mic n = channel n-1), giving the channel-major angles:
- *   ch0=0  ch1=180 | ch2=225 ch3=45 | ch4=270 ch5=90 | ch6=315 ch7=135  (deg)
- * So the "even" channel of each opposite pair sits at phi_k = {0,225,270,315} deg
- * (was {0,45,90,135} before the wiring was corrected -> pairs 1,2,3 sign-flipped).
- * The geometry is baked into the hardcoded g_doa_table below, so no runtime
- * coordinate array is needed. */
+ * wires two diametrically opposed mics. With MIC_REMAP applied at deinterleave,
+ * mic_data is in CLEAN label order (Mic1..Mic8):
+ *   slot0=0  slot1=180 | slot2=45 slot3=225 | slot4=90 slot5=270 | slot6=135 slot7=315 (deg)
+ * so opposite pair k = (slot 2k, slot 2k+1) and the even slot sits at the natural
+ * baseline phi_k = {0,45,90,135} deg. The hardware miswiring is absorbed entirely
+ * by MIC_REMAP (see Deinterleave_Pair), NOT by this table. */
 
 /* Candidate azimuths (degrees, 16 directions × 22.5°). */
 static const float g_doa_angles[DOA_N_AZ] = {
@@ -1323,26 +1343,27 @@ static const float g_doa_angles[DOA_N_AZ] = {
 
 /* TASK-11: HARDCODED TDOA table. g_doa_table[a][k] = expected lag (samples) on
  * opposite pair k for a source at azimuth g_doa_angles[a].
- * Pair k = GCC_PHAT(ch[2k], ch[2k+1]); baseline angle phi_k = {0,225,270,315} deg.
+ * Pair k = GCC_PHAT(slot[2k], slot[2k+1]); baseline angle phi_k = {0,45,90,135} deg
+ * (clean label order; hardware scramble handled by MIC_REMAP, not this table).
  * Formula:  lag = (Fs/C) * 2R * cos(az - phi_k),  (Fs/C)*2R = 3.731778 samples.
  * Regenerate if Fs, R, or the pair wiring changes. */
 static const float g_doa_table[DOA_N_AZ][DOA_NPAIRS] = {
-  {   3.731778f,  -2.638766f,   0.000000f,   2.638766f },  /* az=  0.0 */
-  {   3.447714f,  -3.447714f,  -1.428090f,   1.428090f },  /* az= 22.5 */
-  {   2.638766f,  -3.731778f,  -2.638766f,   0.000000f },  /* az= 45.0 */
-  {   1.428090f,  -3.447714f,  -3.447714f,  -1.428090f },  /* az= 67.5 */
-  {   0.000000f,  -2.638766f,  -3.731778f,  -2.638766f },  /* az= 90.0 */
-  {  -1.428090f,  -1.428090f,  -3.447714f,  -3.447714f },  /* az=112.5 */
-  {  -2.638766f,   0.000000f,  -2.638766f,  -3.731778f },  /* az=135.0 */
-  {  -3.447714f,   1.428090f,  -1.428090f,  -3.447714f },  /* az=157.5 */
-  {  -3.731778f,   2.638766f,   0.000000f,  -2.638766f },  /* az=180.0 */
-  {  -3.447714f,   3.447714f,   1.428090f,  -1.428090f },  /* az=202.5 */
-  {  -2.638766f,   3.731778f,   2.638766f,   0.000000f },  /* az=225.0 */
-  {  -1.428090f,   3.447714f,   3.447714f,   1.428090f },  /* az=247.5 */
-  {   0.000000f,   2.638766f,   3.731778f,   2.638766f },  /* az=270.0 */
-  {   1.428090f,   1.428090f,   3.447714f,   3.447714f },  /* az=292.5 */
-  {   2.638766f,   0.000000f,   2.638766f,   3.731778f },  /* az=315.0 */
-  {   3.447714f,  -1.428090f,   1.428090f,   3.447714f },  /* az=337.5 */
+  {   3.731778f,   2.638766f,   0.000000f,  -2.638766f },  /* az=  0.0 */
+  {   3.447714f,   3.447714f,   1.428090f,  -1.428090f },  /* az= 22.5 */
+  {   2.638766f,   3.731778f,   2.638766f,   0.000000f },  /* az= 45.0 */
+  {   1.428090f,   3.447714f,   3.447714f,   1.428090f },  /* az= 67.5 */
+  {   0.000000f,   2.638766f,   3.731778f,   2.638766f },  /* az= 90.0 */
+  {  -1.428090f,   1.428090f,   3.447714f,   3.447714f },  /* az=112.5 */
+  {  -2.638766f,   0.000000f,   2.638766f,   3.731778f },  /* az=135.0 */
+  {  -3.447714f,  -1.428090f,   1.428090f,   3.447714f },  /* az=157.5 */
+  {  -3.731778f,  -2.638766f,   0.000000f,   2.638766f },  /* az=180.0 */
+  {  -3.447714f,  -3.447714f,  -1.428090f,   1.428090f },  /* az=202.5 */
+  {  -2.638766f,  -3.731778f,  -2.638766f,   0.000000f },  /* az=225.0 */
+  {  -1.428090f,  -3.447714f,  -3.447714f,  -1.428090f },  /* az=247.5 */
+  {   0.000000f,  -2.638766f,  -3.731778f,  -2.638766f },  /* az=270.0 */
+  {   1.428090f,  -1.428090f,  -3.447714f,  -3.447714f },  /* az=292.5 */
+  {   2.638766f,   0.000000f,  -2.638766f,  -3.731778f },  /* az=315.0 */
+  {   3.447714f,   1.428090f,  -1.428090f,  -3.447714f },  /* az=337.5 */
 };
 
 /**

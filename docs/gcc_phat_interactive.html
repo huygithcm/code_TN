@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GCC-PHAT tương tác — học lại công thức</title>
+<style>
+  :root{
+    --bg:#0f1419; --panel:#171f2a; --panel2:#1e2836; --ink:#e6edf3;
+    --mut:#8b98a8; --acc:#4dabf7; --acc2:#ff8787; --ok:#69db7c; --warn:#ffd43b;
+    --grid:#2a3645; --line-a:#4dabf7; --line-b:#ff8787; --line-r:#69db7c;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:"Segoe UI",system-ui,sans-serif;background:var(--bg);
+    color:var(--ink);line-height:1.55;}
+  header{padding:24px 28px;background:linear-gradient(120deg,#11202e,#1a2a1e);
+    border-bottom:1px solid var(--grid)}
+  h1{margin:0 0 6px;font-size:24px}
+  header p{margin:0;color:var(--mut)}
+  .wrap{max-width:1080px;margin:0 auto;padding:20px 16px 80px}
+  .step{background:var(--panel);border:1px solid var(--grid);border-radius:12px;
+    padding:18px 20px;margin:18px 0;}
+  .step h2{margin:0 0 4px;font-size:18px;color:var(--acc)}
+  .badge{display:inline-block;font-size:12px;font-weight:700;color:#0f1419;
+    background:var(--acc);border-radius:6px;padding:1px 8px;margin-right:8px}
+  .formula{background:#0b1118;border:1px solid var(--grid);border-radius:8px;
+    padding:12px 16px;margin:12px 0;font-family:"Consolas","Courier New",monospace;
+    font-size:15px;color:var(--warn);overflow-x:auto}
+  .mut{color:var(--mut)}
+  canvas{width:100%;height:auto;background:#0b1118;border:1px solid var(--grid);
+    border-radius:8px;display:block;margin-top:8px}
+  .controls{display:flex;flex-wrap:wrap;gap:18px;align-items:center;
+    background:var(--panel2);border:1px solid var(--grid);border-radius:10px;
+    padding:14px 18px;margin:6px 0 14px;position:sticky;top:0;z-index:5}
+  .ctl{display:flex;flex-direction:column;gap:2px;min-width:160px}
+  .ctl label{font-size:12px;color:var(--mut)}
+  .ctl input[type=range]{width:200px;accent-color:var(--acc)}
+  .val{font-weight:700;color:var(--acc)}
+  select,button{background:var(--panel);color:var(--ink);border:1px solid var(--grid);
+    border-radius:6px;padding:6px 10px;font-size:13px;cursor:pointer}
+  .legend{font-size:12px;margin-top:6px}
+  .legend span{display:inline-block;margin-right:14px}
+  .dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:5px;
+    vertical-align:middle}
+  .result{font-size:15px;margin-top:10px}
+  .result b{color:var(--ok);font-size:18px}
+  code{background:#0b1118;border:1px solid var(--grid);border-radius:4px;padding:1px 5px;
+    font-family:Consolas,monospace;color:var(--line-r)}
+  table{border-collapse:collapse;margin-top:8px;font-size:13px}
+  td,th{border:1px solid var(--grid);padding:5px 10px;text-align:right}
+  th{color:var(--mut);font-weight:600}
+  .note{font-size:13px;color:var(--mut);border-left:3px solid var(--acc);
+    padding-left:12px;margin:10px 0}
+  .src{float:right;font-size:12px;color:#69db7c;text-decoration:none;
+    background:#0b1118;border:1px solid var(--grid);border-radius:6px;padding:2px 8px}
+  .src:hover{border-color:#69db7c}
+</style>
+</head>
+<body>
+<header>
+  <h1>GCC-PHAT tương tác — ước lượng độ trễ giữa 2 micro</h1>
+  <p>Kéo các thanh trượt để thay đổi tín hiệu nguồn và độ trễ thật, rồi xem từng bước công thức biến đổi như thế nào. Khớp 1-1 với <code>GCC_PHAT()</code> trong main.c.</p>
+  <p style="margin-top:8px"><a href="../Src/main.c" style="color:#69db7c;font-weight:700">→ Mở Src/main.c (hàm GCC_PHAT, dòng 1204–1254)</a></p>
+</header>
+
+<div class="wrap">
+
+  <div class="controls">
+    <div class="ctl">
+      <label>Độ trễ thật b sau a: <span class="val" id="dLbl">3.0</span> mẫu</label>
+      <input type="range" id="delay" min="-12" max="12" step="0.25" value="3">
+    </div>
+    <div class="ctl">
+      <label>Loại tín hiệu nguồn</label>
+      <select id="sig">
+        <option value="broadband">Broadband (nhiễu băng rộng)</option>
+        <option value="tone">Tone đơn (1 tần số)</option>
+        <option value="twotone">Hai tone</option>
+        <option value="pulse">Xung (click)</option>
+      </select>
+    </div>
+    <div class="ctl">
+      <label>Nhiễu nền: <span class="val" id="nLbl">0.05</span></label>
+      <input type="range" id="noise" min="0" max="0.6" step="0.01" value="0.05">
+    </div>
+    <div class="ctl">
+      <label>PHAT whitening</label>
+      <select id="phat">
+        <option value="1">BẬT (GCC-PHAT)</option>
+        <option value="0">TẮT (cross-corr thường)</option>
+      </select>
+    </div>
+  </div>
+
+  <!-- STEP 1 -->
+  <div class="step">
+    <a class="src" href="../Src/main.c#L1208-L1211">main.c:1208–1211</a>
+    <h2><span class="badge">1</span>Hai tín hiệu micro x_a[n], x_b[n]</h2>
+    <p class="mut">b là bản sao của a bị trễ <code id="d1">D</code> mẫu (cộng nhiễu). Mục tiêu: đo lại D mà ban đầu ta không biết.</p>
+    <canvas id="cSig" width="1040" height="200"></canvas>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--line-a)"></i>x_a (mic a)</span>
+      <span><i class="dot" style="background:var(--line-b)"></i>x_b (mic b, trễ)</span>
+    </div>
+  </div>
+
+  <!-- STEP 2 -->
+  <div class="step">
+    <a class="src" href="../Src/main.c#L1208-L1211">main.c:1208–1211</a>
+    <h2><span class="badge">2</span>FFT → phổ X_a, X_b</h2>
+    <div class="formula">X_a = FFT(x_a) ,  X_b = FFT(x_b)   // arm_rfft_fast_f32(...,0)</div>
+    <p class="mut">Trễ trong miền thời gian ⇔ một độ dốc pha tuyến tính trong miền tần số: X_b(f) = X_a(f)·e^(−j·2π·f·D). Biên độ |X| gần như giữ nguyên; thông tin trễ nằm hết ở <b>pha</b>.</p>
+    <canvas id="cMag" width="1040" height="160"></canvas>
+    <div class="legend"><span><i class="dot" style="background:var(--line-a)"></i>|X_a|</span><span><i class="dot" style="background:var(--line-b)"></i>|X_b|</span></div>
+  </div>
+
+  <!-- STEP 3 -->
+  <div class="step">
+    <a class="src" href="../Src/main.c#L1220-L1225">main.c:1220–1225</a>
+    <h2><span class="badge">3</span>Cross-spectrum: R = conj(X_a)·X_b</h2>
+    <div class="formula">conj(X_a)·X_b = (ar − j·ai)(br + j·bi)
+re = ar·br + ai·bi
+im = ar·bi − ai·br</div>
+    <p class="mut">Nhân liên hợp X_a với X_b. Pha của R(f) = pha(X_b) − pha(X_a) = −2π·f·D — chính là độ dốc chứa độ trễ. Đây đúng 2 dòng <code>re</code>/<code>im</code> trong code.</p>
+    <canvas id="cPhase" width="1040" height="160"></canvas>
+    <div class="legend"><span><i class="dot" style="background:var(--line-r)"></i>pha của R(f) (độ dốc ∝ −D)</span></div>
+  </div>
+
+  <!-- STEP 4 -->
+  <div class="step">
+    <a class="src" href="../Src/main.c#L1226-L1229">main.c:1226–1229</a>
+    <h2><span class="badge">4</span>PHAT whitening: chia cho biên độ</h2>
+    <div class="formula">R_phat(f) = R(f) / |R(f)|     (|R| ← max(|R|, 1e-9) chống chia 0)</div>
+    <p class="mut">Bỏ hết biên độ, chỉ giữ pha (mỗi bin thành véc-tơ đơn vị). Mọi tần số được "cân bằng" như nhau → đỉnh tương quan nhọn và bền với phổ nguồn / vang. Đổi PHAT sang TẮT để thấy đỉnh tù đi.</p>
+    <canvas id="cWhite" width="1040" height="150"></canvas>
+    <div class="legend"><span><i class="dot" style="background:var(--line-a)"></i>|R| trước</span><span><i class="dot" style="background:var(--line-r)"></i>|R_phat| sau (=1 khi BẬT)</span></div>
+  </div>
+
+  <!-- STEP 5 -->
+  <div class="step">
+    <a class="src" href="../Src/main.c#L1232-L1236">main.c:1232–1236</a>
+    <h2><span class="badge">5</span>IFFT → hàm tương quan r[n]</h2>
+    <div class="formula">r[n] = IFFT( R_phat )   // arm_rfft_fast_f32(...,1)
+lag = argmax_n  r[n]   // arm_max_f32 ; n > N/2 ⇒ lag âm</div>
+    <p class="mut">Biến đổi ngược về miền thời gian. Vị trí đỉnh = độ trễ D. Trục đã được cuộn (wrap) để delay âm nằm bên trái 0.</p>
+    <canvas id="cCorr" width="1040" height="220"></canvas>
+  </div>
+
+  <!-- STEP 6 -->
+  <div class="step">
+    <a class="src" href="../Src/main.c#L1242-L1252">main.c:1242–1252</a>
+    <h2><span class="badge">6</span>Nội suy parabol → lag phân số (sub-sample)</h2>
+    <div class="formula">δ = 0.5·(y₋₁ − y₊₁) / (y₋₁ − 2·y₀ + y₊₁)      (kẹp δ ∈ [−1, 1])
+lag_phân_số = lag + δ</div>
+    <p class="mut">Đỉnh nguyên quá thô (delay thật chỉ ~vài mẫu). Fit parabol qua 3 điểm quanh đỉnh để lấy phần lẻ. Đây là <code>g_last_frac</code> dùng cho bước tính góc DOA.</p>
+    <table id="tbl">
+      <tr><th>n−1</th><th>n₀ (đỉnh)</th><th>n+1</th></tr>
+      <tr><td id="ym1">–</td><td id="y0">–</td><td id="yp1">–</td></tr>
+    </table>
+    <div class="result">
+      Lag nguyên: <b id="rLag">–</b> &nbsp;|&nbsp; δ = <b id="rDelta">–</b> &nbsp;|&nbsp;
+      Lag phân số ước lượng: <b id="rFrac">–</b> mẫu &nbsp;
+      <span class="mut">(thật = <span id="rTrue">–</span>)</span>
+    </div>
+    <div class="note">Sai số = |ước lượng − thật|: <b id="rErr">–</b> mẫu. Thử bật nhiễu cao hoặc tone đơn để thấy GCC-PHAT kém đi như thế nào — PHAT cần năng lượng trải đều trên nhiều bin (broadband).</div>
+  </div>
+
+</div>
+
+<script>
+// ---- DFT trực tiếp (N nhỏ, đủ nhanh cho minh hoạ) ----
+const N = 128;                 // kích thước FFT minh hoạ
+const BINS = N/2;
+const TWO_PI = 2*Math.PI;
+
+function makeSignal(type, noise, delay){
+  const a = new Float32Array(N), b = new Float32Array(N);
+  // sinh nguồn s[n] (tuần hoàn để dịch vòng gọn gàng)
+  const s = new Float32Array(N);
+  let lcg = 22695477>>>0;
+  for(let n=0;n<N;n++){
+    let v=0;
+    if(type==='broadband'){ lcg=(lcg*1103515245+12345)>>>0; v=((lcg>>>9)/8388608)-1; }
+    else if(type==='tone'){ v=Math.sin(TWO_PI*7*n/N); }
+    else if(type==='twotone'){ v=Math.sin(TWO_PI*5*n/N)+0.7*Math.sin(TWO_PI*19*n/N); }
+    else if(type==='pulse'){ v=Math.exp(-Math.pow((n-N/2)/2.5,2)); }
+    s[n]=v;
+  }
+  // a = s ; b = s dịch vòng (nội suy tuyến tính cho delay phân số)
+  for(let n=0;n<N;n++){
+    a[n]=s[n];
+    const idx=n-delay;                // b[n] = s[n - D]
+    const i0=Math.floor(idx), fr=idx-i0;
+    const s0=s[((i0%N)+N)%N], s1=s[(((i0+1)%N)+N)%N];
+    b[n]=s0*(1-fr)+s1*fr;
+  }
+  // nhiễu độc lập mỗi mic
+  for(let n=0;n<N;n++){
+    a[n]+= noise*(Math.random()*2-1);
+    b[n]+= noise*(Math.random()*2-1);
+  }
+  return {a,b};
+}
+
+function dft(x){
+  const re=new Float32Array(N), im=new Float32Array(N);
+  for(let k=0;k<N;k++){
+    let sr=0,si=0;
+    for(let n=0;n<N;n++){
+      const ph=-TWO_PI*k*n/N;
+      sr+=x[n]*Math.cos(ph); si+=x[n]*Math.sin(ph);
+    }
+    re[k]=sr; im[k]=si;
+  }
+  return {re,im};
+}
+function idftReal(re,im){
+  const out=new Float32Array(N);
+  for(let n=0;n<N;n++){
+    let s=0;
+    for(let k=0;k<N;k++){
+      const ph=TWO_PI*k*n/N;
+      s+=re[k]*Math.cos(ph)-im[k]*Math.sin(ph);
+    }
+    out[n]=s/N;
+  }
+  return out;
+}
+
+// ---- vẽ ----
+function clr(ctx,w,h){ctx.clearRect(0,0,w,h);ctx.fillStyle='#0b1118';ctx.fillRect(0,0,w,h);}
+function axis(ctx,w,h){ctx.strokeStyle='#2a3645';ctx.lineWidth=1;ctx.beginPath();
+  ctx.moveTo(0,h/2);ctx.lineTo(w,h/2);ctx.stroke();}
+function plot(ctx,w,h,arr,color,cx,scale){
+  ctx.strokeStyle=color;ctx.lineWidth=1.6;ctx.beginPath();
+  const max=scale||Math.max(1e-6,...arr.map(Math.abs));
+  for(let i=0;i<arr.length;i++){
+    const x=i/(arr.length-1)*w;
+    const y=h/2 - (arr[i]/max)*(h/2-8);
+    i?ctx.lineTo(x,y):ctx.moveTo(x,y);
+  }
+  ctx.stroke();
+  return max;
+}
+function bars(ctx,w,h,arr,color,base){
+  ctx.strokeStyle=color;ctx.lineWidth=1.6;ctx.beginPath();
+  const max=Math.max(1e-6,...arr);
+  for(let i=0;i<arr.length;i++){
+    const x=i/(arr.length-1)*w;
+    const y=h-6-(arr[i]/max)*(h-14);
+    i?ctx.lineTo(x,y):ctx.moveTo(x,y);
+  }
+  ctx.stroke();
+}
+
+const $=id=>document.getElementById(id);
+
+function update(){
+  const delay=parseFloat($('delay').value);
+  const type=$('sig').value;
+  const noise=parseFloat($('noise').value);
+  const usePhat=$('phat').value==='1';
+  $('dLbl').textContent=delay.toFixed(2);
+  $('nLbl').textContent=noise.toFixed(2);
+  $('d1').textContent='D = '+delay.toFixed(2);
+  $('rTrue').textContent=delay.toFixed(2);
+
+  const {a,b}=makeSignal(type,noise,delay);
+
+  // STEP 1
+  let c=$('cSig'),ctx=c.getContext('2d'),w=c.width,h=c.height;
+  clr(ctx,w,h);axis(ctx,w,h);
+  const sc=Math.max(...a.map(Math.abs),...b.map(Math.abs),0.5);
+  plot(ctx,w,h,a,getCSS('--line-a'),0,sc);
+  plot(ctx,w,h,b,getCSS('--line-b'),0,sc);
+
+  // STEP 2 — FFT
+  const Xa=dft(a), Xb=dft(b);
+  const magA=[],magB=[];
+  for(let k=0;k<BINS;k++){
+    magA.push(Math.hypot(Xa.re[k],Xa.im[k]));
+    magB.push(Math.hypot(Xb.re[k],Xb.im[k]));
+  }
+  c=$('cMag');ctx=c.getContext('2d');w=c.width;h=c.height;clr(ctx,w,h);
+  bars(ctx,w,h,magA,getCSS('--line-a'));
+  bars(ctx,w,h,magB,getCSS('--line-b'));
+
+  // STEP 3 — cross spectrum R = conj(Xa)*Xb
+  const Rre=new Float32Array(N), Rim=new Float32Array(N), Rmag=[];
+  const phase=[];
+  for(let k=0;k<N;k++){
+    const ar=Xa.re[k],ai=Xa.im[k],br=Xb.re[k],bi=Xb.im[k];
+    const re=ar*br+ai*bi;
+    const im=ar*bi-ai*br;
+    Rre[k]=re;Rim[k]=im;
+    if(k<BINS){Rmag.push(Math.hypot(re,im));phase.push(Math.atan2(im,re));}
+  }
+  c=$('cPhase');ctx=c.getContext('2d');w=c.width;h=c.height;clr(ctx,w,h);axis(ctx,w,h);
+  plot(ctx,w,h,phase,getCSS('--line-r'),0,Math.PI);
+
+  // STEP 4 — PHAT whitening
+  const Rpre=new Float32Array(N),Rpim=new Float32Array(N),RmagAfter=[];
+  for(let k=0;k<N;k++){
+    let mag=Math.hypot(Rre[k],Rim[k]);
+    if(mag<1e-9)mag=1e-9;
+    if(usePhat){ Rpre[k]=Rre[k]/mag; Rpim[k]=Rim[k]/mag; }
+    else       { Rpre[k]=Rre[k];     Rpim[k]=Rim[k]; }
+    if(k<BINS)RmagAfter.push(Math.hypot(Rpre[k],Rpim[k]));
+  }
+  c=$('cWhite');ctx=c.getContext('2d');w=c.width;h=c.height;clr(ctx,w,h);
+  bars(ctx,w,h,Rmag,getCSS('--line-a'));
+  bars(ctx,w,h,RmagAfter,getCSS('--line-r'));
+
+  // STEP 5 — IFFT -> correlation, đỉnh
+  const corr=idftReal(Rpre,Rpim);
+  // dựng mảng đã wrap để vẽ: [-N/2 .. N/2)
+  const disp=new Float32Array(N);
+  for(let i=0;i<N;i++){ disp[i]=corr[(i+N/2)%N]; }
+  c=$('cCorr');ctx=c.getContext('2d');w=c.width;h=c.height;clr(ctx,w,h);
+  // lưới mốc 0
+  ctx.strokeStyle='#2a3645';ctx.beginPath();ctx.moveTo(w/2,0);ctx.lineTo(w/2,h);ctx.stroke();
+  ctx.strokeStyle='#384a5e';ctx.beginPath();ctx.moveTo(0,h-10);ctx.lineTo(w,h-10);ctx.stroke();
+  const cmax=Math.max(...disp.map(Math.abs));
+  ctx.strokeStyle=getCSS('--line-r');ctx.lineWidth=1.8;ctx.beginPath();
+  for(let i=0;i<N;i++){
+    const x=i/(N-1)*w, y=(h-10)-(disp[i]/cmax)*(h-30);
+    i?ctx.lineTo(x,y):ctx.moveTo(x,y);
+  }
+  ctx.stroke();
+
+  // tìm đỉnh trên corr gốc
+  let maxIdx=0,maxVal=-1e30;
+  for(let i=0;i<N;i++){ if(corr[i]>maxVal){maxVal=corr[i];maxIdx=i;} }
+  const im1=(maxIdx===0)?N-1:maxIdx-1;
+  const ip1=(maxIdx+1===N)?0:maxIdx+1;
+  const ym1=corr[im1],y0=corr[maxIdx],yp1=corr[ip1];
+  const denom=ym1-2*y0+yp1;
+  let delta=Math.abs(denom)>1e-12?0.5*(ym1-yp1)/denom:0;
+  delta=Math.max(-1,Math.min(1,delta));
+  let lag=maxIdx; if(lag>N/2)lag-=N;
+  const frac=lag+delta;
+
+  // đánh dấu đỉnh
+  const px=((maxIdx+N/2)%N)/(N-1)*w;
+  const py=(h-10)-(y0/cmax)*(h-30);
+  ctx.fillStyle=getCSS('--warn');ctx.beginPath();ctx.arc(px,py,4,0,TWO_PI);ctx.fill();
+  ctx.fillStyle=getCSS('--mut');ctx.font='12px Consolas';
+  ctx.fillText('lag = '+lag,px+8,py-4);
+  ctx.fillText('-N/2',4,14);ctx.fillText('0',w/2+4,14);ctx.fillText('+N/2',w-34,14);
+
+  // STEP 6
+  $('ym1').textContent=ym1.toExponential(2);
+  $('y0').textContent=y0.toExponential(2);
+  $('yp1').textContent=yp1.toExponential(2);
+  $('rLag').textContent=lag;
+  $('rDelta').textContent=delta.toFixed(3);
+  $('rFrac').textContent=frac.toFixed(3);
+  $('rErr').textContent=Math.abs(frac-delay).toFixed(3);
+}
+
+function getCSS(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim();}
+
+['delay','sig','noise','phat'].forEach(id=>{
+  $(id).addEventListener('input',update);
+  $(id).addEventListener('change',update);
+});
+update();
+</script>
+</body>
+</html>

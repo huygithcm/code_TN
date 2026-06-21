@@ -34,39 +34,43 @@ MAX_DETECTIONS = 500   # gioi han lich su nguon am de khong phinh bo nho
 
 # ---------------------------------------------------------------- cau hinh mang
 MIC_RADIUS_MM = 40.0                       # MIC_ARRAY_RADIUS_M = 0.040 m trong main.c
-# 8 mic UCA. Goc dat mic la co d
-# inh theo phan cung SAI (firmware):
-#   ch0=0  ch1=180 | ch2=45 ch3=225 | ch4=90 ch5=270 | ch6=135 ch7=315
-# So in TREN BOARD THUC doc CUNG chieu kim dong ho (CW) tu 0 deg la:
-#   1, 7, 5, 3, 2, 8, 6, 4
-# Moi mic: (goc dat deg, so tren board, kenh firmware ch). Mic n = ch n-1.
+# 8 mic UCA. Nhan mic theo quy uoc CHUAN (nhu hinh thiet ke):
+#   Mic1=0  Mic2=180 | Mic3=45 Mic4=225 | Mic5=90 Mic6=270 | Mic7=135 Mic8=315 (deg)
+# Cap doi tam: (Mic1,Mic2)(Mic3,Mic4)(Mic5,Mic6)(Mic7,Mic8) -> phi_k={0,45,90,135}.
+# Phan cung noi nham nen kenh thu DMA khong dung thu tu nhan; firmware sua bang
+# MIC_REMAP={0,1,3,2,5,4,7,6} luc deinterleave (xem Src/main.c). Cot 'ch' duoi la
+# kenh thu VAT LY dang o goc do (khong doi boi remap).
+# Moi mic: (goc dat deg, so mic theo hinh, kenh thu firmware ch).
 MICS = [
-    (0,   1, 0),   # ch0
-    (45,  4, 3),   # ch3
-    (90,  6, 5),   # ch5
-    (135, 8, 7),   # ch7
-    (180, 2, 1),   # ch1
-    (225, 3, 2),   # ch2
-    (270, 5, 4),   # ch4
-    (315, 7, 6),   # ch6
+    (0,   1, 0),   # Mic1 @ ch0
+    (45,  3, 3),   # Mic3 @ ch3
+    (90,  5, 5),   # Mic5 @ ch5
+    (135, 7, 7),   # Mic7 @ ch7
+    (180, 2, 1),   # Mic2 @ ch1
+    (225, 4, 2),   # Mic4 @ ch2
+    (270, 6, 4),   # Mic6 @ ch4
+    (315, 8, 6),   # Mic8 @ ch6
 ]
 
-# Offset xoay CHI DUNG KHI VE (ap cho ca mic + mui ten DOA + cham nguon am, hinh
-# van nhat quan; KHONG dong cham quy uoc az/servo). 180 deg dat mic 1 (az 0) vao
-# dung vi tri mic 5 (az 270) tren hinh. Doi gia tri nay de xoay toan bo hinh.
-MIC_DRAW_ROT_DEG = 180.0
+# Quy uoc VE (giong anh thiet ke): az=0 (Mic1) o TREN DINH, goc tang theo CHIEU
+# KIM DONG HO. Chi anh huong cach VE, KHONG dong cham quy uoc az/servo cua firmware.
+#   x = r*sin(az),  y = r*cos(az)   -> az0=top, az90=phai, az180=duoi, az270=trai
+def az_to_xy(az_deg, r):
+    a = np.radians(az_deg)
+    return r * np.sin(a), r * np.cos(a)
 
 # =========================================================================
 # DIRECTION STANDARD  (PHAI khop y het Src/main.c)
 # -------------------------------------------------------------------------
 # Azimuth `az` in [0,360): 0 deg = mic 1 (ch0), tang theo nguoc chieu kim (CCW).
 # Servo in [0,180]:  servo = clamp(90 + SERVO_DIR * wrap(az - SERVO_AZ_CENTER))
-#   SERVO_AZ_CENTER = 0  -> mic 1 (az 0) la FRONT cua camera = servo 90 (neutral)
-#   SERVO_DIR       = -1 -> mic 6 (az 90) = servo 0 ,  mic 5 (az 270) = servo 180
-# Servo 180 deg chi phu nua vong truoc; nguon sau lung (az ~180) kep ve bien.
+# Do tren rig that:  servo 0 -> Mic6(az270),  90 -> Mic2(az180),  180 -> Mic5(az90).
+#   SERVO_AZ_CENTER = 180 -> Mic2 (az 180) la FRONT camera = servo 90 (neutral)
+#   SERVO_DIR       = -1  -> Mic6 (az 270) = servo 0 ,  Mic5 (az 90) = servo 180
+# Servo 180 deg chi phu nua vong; nguon o nua kia (quanh az 0) kep ve bien.
 # Hai hang nay PHAI bang SERVO_AZ_CENTER / SERVO_DIR trong main.c.
 # =========================================================================
-SERVO_AZ_CENTER = 0.0
+SERVO_AZ_CENTER = 180.0
 SERVO_DIR       = -1.0
 
 
@@ -178,25 +182,27 @@ def build_plot():
     ax.set_xlim(-lim, lim)
     ax.set_ylim(-lim, lim)
     ax.set_aspect("equal")
-    ax.set_title("DOA - huong nguon am tren mang mic (UCA 8 mic, R=40mm)")
-    ax.set_xlabel("x (mm)   |   az=0 (mic 1) huong xuong, ve phia nguoi dung")
-    ax.set_ylabel("y (mm)")
-    ax.grid(True, ls=":", alpha=0.4)
+    ax.set_title("Sound Source Localization - UCA 8 mic (R=40mm)")
+    ax.set_xlabel("az=0 (Mic1) o tren dinh, tang theo chieu kim dong ho")
+    ax.set_ylabel("")
+    ax.grid(True, ls=":", alpha=0.3)
 
     # vong tron mang
     th = np.linspace(0, 2 * np.pi, 200)
-    ax.plot(R * np.cos(th), R * np.sin(th), color="0.7", lw=1)
+    ax.plot(R * np.cos(th), R * np.sin(th), color="0.6", lw=1.2)
 
-    # cac mic (nhan = so in tren board thuc). Chi xoay vi tri VE bang
-    # MIC_DRAW_ROT_DEG de mic 1 huong ve nguoi dung; goc DOA giu nguyen.
+    # cac mic: nhan "MicN" o tam cham, goc (do) trong o vuong do o phia ngoai
+    # -> bo cuc giong anh thiet ke.
     for ang, board, ch in MICS:
-        a = np.radians(ang + MIC_DRAW_ROT_DEG)
-        x, y = R * np.cos(a), R * np.sin(a)
-        ax.plot(x, y, "o", color="#1f77b4", ms=12, zorder=3)
-        ax.annotate(str(board), (x, y), ha="center", va="center",
-                    fontsize=9, color="white", fontweight="bold", zorder=4)
-        ax.annotate(f"ch{ch}", (x, y), textcoords="offset points", xytext=(0, 11),
-                    ha="center", fontsize=7.5, color="0.45")
+        x, y = az_to_xy(ang, R)
+        ax.plot(x, y, "o", color="#1f77b4", ms=14, zorder=3)
+        ax.annotate(f"Mic{board}", (x, y), textcoords="offset points",
+                    xytext=(0, 14), ha="center", fontsize=10,
+                    color="#1f3b66", fontweight="bold", zorder=4)
+        bx, by = az_to_xy(ang, R * 1.32)
+        ax.annotate(f"{ang}", (bx, by), ha="center", va="center", fontsize=8.5,
+                    color="crimson", zorder=4,
+                    bbox=dict(boxstyle="square,pad=0.18", fc="white", ec="crimson", lw=1))
     ax.plot(0, 0, "+", color="0.4", ms=12)
 
     # cac nguon am da tinh toan (cham, to dan theo so lan trung huong)
@@ -248,10 +254,8 @@ def main():
                 last_demo_ref[0] = time.time()
         az = reader.az
         if az is not None:
-            # Ap cung MIC_DRAW_ROT_DEG nhu khi ve mic, de mui ten chi dung
-            # huong nguon am THUC TE tren hinh (mic 1 huong ve nguoi dung).
-            a = np.radians(az + MIC_DRAW_ROT_DEG)
-            tip = (R * 1.25 * np.cos(a), R * 1.25 * np.sin(a))
+            # Cung phep bien doi az_to_xy nhu khi ve mic -> mui ten chi dung huong.
+            tip = az_to_xy(az, R * 1.15)
             arrow.xy = tip
             arrow.set_position((0, 0))
             stale = (time.time() - reader.last_update) > 3.0
@@ -280,10 +284,9 @@ def main():
         dets = list(reader.detections)
         if dets:
             cnt = collections.Counter((round(a / 22.5) * 22.5) % 360 for a in dets)
-            angs = np.radians(np.array(list(cnt.keys())) + MIC_DRAW_ROT_DEG)
-            rr = R * 1.45
-            offs = np.column_stack((rr * np.cos(angs), rr * np.sin(angs)))
-            sizes = [40 + 30 * cnt[k] for k in cnt]
+            keys = list(cnt.keys())
+            offs = np.array([az_to_xy(k, R * 1.5) for k in keys])
+            sizes = [40 + 30 * cnt[k] for k in keys]
             src.set_offsets(offs)
             src.set_sizes(sizes)
         else:

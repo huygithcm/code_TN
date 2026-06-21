@@ -49,13 +49,15 @@ Các tool Python tự dò cổng theo VID:PID nên không cần nhớ số COM.
 ## 3. Cấu hình DOA (firmware — `Src/main.c`)
 
 ### Hình học mảng mic (UCA 8 mic, R = 40 mm)
-Mic đánh số trên board **cùng chiều kim đồng hồ: 1,7,5,3,2,8,6,4** (mic n = kênh n−1).
-Map kênh→góc đã hiệu chỉnh theo wiring thật:
+Nhãn mic theo quy ước **chuẩn (như hình thiết kế)**:
 
 ```
-ch0=0°   ch1=180°   ch2=225°  ch3=45°   ch4=270°  ch5=90°   ch6=315°  ch7=135°
+Mic1=0°  Mic2=180° | Mic3=45° Mic4=225° | Mic5=90° Mic6=270° | Mic7=135° Mic8=315°
 ```
-Bảng trễ `g_doa_table` sinh từ `lag = (Fs/C)·2R·cos(az − φ_k)`, φ = [0,225,270,315]°.
+Phần cứng nối nhầm nên kênh thu DMA không đúng thứ tự nhãn; firmware sửa **một chỗ**
+bằng `MIC_REMAP = {0,1,3,2,5,4,7,6}` lúc deinterleave (xem `Src/main.c`). Nhờ vậy
+`mic_data[]` về đúng thứ tự Mic1…Mic8, cặp đối tâm sạch, baseline φ = [0,45,90,135]°.
+Bảng trễ `g_doa_table` sinh từ `lag = (Fs/C)·2R·cos(az − φ_k)`, φ = [0,45,90,135]°.
 Quy ước góc: 0° = +x (mic số 1), CCW dương.
 
 ### Ngưỡng clap-gate (biến runtime, chỉnh được lúc chạy)

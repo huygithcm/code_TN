@@ -141,7 +141,7 @@ servo = clamp( 90 + SERVO_DIR · r , 0 , 180 )
 
 | Hằng số | Giá trị | Ý nghĩa |
 |---|---|---|
-| `SERVO_AZ_CENTER` | 0° | azimuth ứng với servo 90° (chính diện = mic 1) |
+| `SERVO_AZ_CENTER` | 180° | azimuth ứng với servo 90° (chính diện = Mic2) |
 | `SERVO_DIR` | −1 | chiều pan (đảo dấu nếu camera quay ngược) |
 
 ```mermaid
@@ -157,9 +157,9 @@ Ví dụ (cả firmware `main.c` và `tools/plot_doa.py` cho **cùng kết quả
 
 | Nguồn âm | az | servo |
 |---|---|---|
-| mic 1 (chính diện) | 0° | 90° (neutral) |
-| mic 6 | 90° | 0° |
-| mic 5 | 270° | 180° |
+| Mic2 (chính diện) | 180° | 90° (neutral) |
+| Mic6 | 270° | 0° |
+| Mic5 | 90° | 180° |
 
 > ⚠️ `SERVO_AZ_CENTER` và `SERVO_DIR` phải **bằng nhau** ở cả `Src/main.c` và
 > `tools/plot_doa.py` để hình mô phỏng khớp với servo thật.
