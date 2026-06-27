@@ -105,6 +105,7 @@ typedef struct
   uint32_t seq;                       /* processed-block counter                  */
   float    lag[GCC_NPAIRS_LIVE];      /* 4 opposite-pair TDOAs, fractional samples */
   float    level;                     /* ch0 frame RMS² (for the clap input gate) */
+  uint8_t  clipped;                   /* 1 = a mic saturated this frame (diagnostic) */
 } tdoa_result_t;
 /* USER CODE END PD */
 
@@ -252,11 +253,19 @@ volatile float g_doa_err;                        /* normalised min residual    *
  * Defaults are the relaxed/easy-to-trigger values. g_cfg_dirty is raised by the
  * CDC parser so DOA_Task echoes the new config to the VCP log. */
 volatile float   g_clap_ratio    = 1.8f;         /* clap if level > ratio*floor */
-volatile float   g_clap_abs      = 0.0005f;      /* absolute level floor. Measured
-                                                  * clap level ~0.001-0.005 here,
-                                                  * so 0.15 (old) blocked all claps. */
+volatile float   g_clap_abs      = 0.000005f;    /* absolute level floor (sum over a
+                                                  * frame of normalised ch0 energy).
+                                                  * Soft speech ~3e-5..1e-4; silence
+                                                  * ~7e-6. 5e-6 lets speech through and
+                                                  * the residual gate rejects noise.
+                                                  * (Was 0.0005 = ~10x too high, so
+                                                  * normal speech never passed.) */
 volatile float   g_doa_resid_max = 0.7f;         /* reject fits worse than this */
 volatile uint8_t g_cfg_dirty     = 0U;           /* CDC parser -> DOA_Task echo */
+/* Voice-tracking mode: 0 = clap gate (impulsive onset only); 1 = continuous voice
+ * activity - any frame whose band-limited energy is above g_clap_abs is voted on,
+ * so the camera follows a person talking (not just hand claps). */
+volatile uint8_t g_voice_mode    = 1U;
 #endif
 #endif
 #endif
@@ -401,11 +410,15 @@ void Servo_SetAngle(float deg)
  * Blocking via HAL_Delay - fine both before the RTOS (boot) and inside a task. */
 #define SERVO_STEP_DEG   3.0f      /* size of each move step                  */
 #define SERVO_STEP_MS    20U       /* delay per step (~ servo travel speed)   */
+#define SERVO_DEADBAND_DEG 4.0f    /* ignore moves smaller than this (anti-jitter) */
 void Servo_MoveTo(float deg)
 {
   if (deg < 0.0f)   { deg = 0.0f; }
   if (deg > 180.0f) { deg = 180.0f; }
   float cur  = g_servo_deg;
+  /* Dead-band: don't twitch for tiny target changes - each move makes mechanical
+   * noise the mics hear, so micro-moves would needlessly re-arm the feedback path. */
+  if (fabsf(deg - cur) < SERVO_DEADBAND_DEG) { return; }
   float step = (deg >= cur) ? SERVO_STEP_DEG : -SERVO_STEP_DEG;
   while (fabsf(deg - cur) > SERVO_STEP_DEG)
   {
@@ -1048,7 +1061,16 @@ void HAL_SAI_RxCpltCallback(SAI_HandleTypeDef *hsai)
  * Each capture ch routed to the slot whose pair-angle matches:
  *   ch0->0  ch1->1  ch2->6  ch3->7  ch4->4  ch5->5  ch6->2  ch7->3
  * (Re-run the test if the board is re-wired; only this array needs editing.) */
-static const uint8_t MIC_REMAP[NUM_MIC_CHANNELS] = { 0U, 1U, 6U, 7U, 4U, 5U, 2U, 3U };
+static const uint8_t MIC_REMAP[NUM_MIC_CHANNELS] = { 0U, 1U, 7U, 6U, 5U, 4U, 2U, 3U };
+
+/* Per-mic sensitivity normalisation, indexed by LOGICAL slot (Mic1..Mic8 order,
+ * same column order as tools/test_mic_order.py). Measured from ambient RMS via
+ * the calibration sweep: gain[k] = median(RMS) / RMS[k]. Mic6 (slot5) reads
+ * ~3x hotter than the others, so it is attenuated to ~0.33. Re-measure and
+ * update if mics/wiring change. */
+static const float MIC_GAIN[NUM_MIC_CHANNELS] = {
+  1.1874f, 0.8557f, 1.1132f, 1.0532f, 0.3341f, 0.9961f, 1.0040f, 0.9541f
+};
 
 /* Deinterleave one stereo pair's half-buffer into the two per-mic arrays.
  * SAI 24-bit data is MSB-left-justified in a 32-bit slot, so the signed 24-bit
@@ -1071,8 +1093,8 @@ static void Deinterleave_Pair(uint32_t off, uint8_t pair)
     int32_t rr = r_sign * (int32_t)(int16_t)(src[2U * i + 1U] & 0xFFFF);
     mic_raw[ld][i]  = rl;
     mic_raw[rd][i]  = rr;
-    mic_data[ld][i] = (float)rl * (1.0f / 8388608.0f);
-    mic_data[rd][i] = (float)rr * (1.0f / 8388608.0f);
+    mic_data[ld][i] = (float)rl * (1.0f / 8388608.0f) * MIC_GAIN[ld];
+    mic_data[rd][i] = (float)rr * (1.0f / 8388608.0f) * MIC_GAIN[rd];
   }
 }
 
@@ -1600,6 +1622,20 @@ void StartTask02(void *argument)
       }
       res.level = level;
     }
+    /* Clipping detector: if any mic saturated this frame, the waveform is distorted
+     * and its phase (hence DOA) is unreliable - flag it so DOA_Task drops the frame.
+     * mic_raw holds 16-bit-justified samples, full-scale ~32767. */
+    {
+      res.clipped = 0U;
+      for (uint8_t c = 0U; c < NUM_MIC_CHANNELS && !res.clipped; c++)
+      {
+        for (uint32_t n = 0U; n < AUDIO_BLOCK_SAMPLES; n++)
+        {
+          int32_t v = mic_raw[c][n];
+          if (v >= 32000 || v <= -32000) { res.clipped = 1U; break; }
+        }
+      }
+    }
     osMessageQueuePut(result_queueHandle, &res, 0U, 0U);
 #endif
 #endif
@@ -1694,6 +1730,13 @@ void StartTask04(void *argument)
 
 #define DOA_WIN_BLOCKS 16U             /* ~1 s at 16 blocks/s                   */
 #define CLAP_BG_ALPHA  0.10f           /* noise-floor EMA rate (non-clap frames) */
+#define SERVO_SETTLE_MS 500U           /* blank window after a move (servo noise) */
+#define VOTE_DECAY      0.45f          /* voice-mode: carry-over of votes per window */
+  /* Frames captured while the servo is moving (and for a short settle afterwards)
+   * carry the servo's own mechanical noise. Processing them re-triggers the clap
+   * gate and the camera spins forever in a quiet room. We blank detection until
+   * this tick and flush the queue right after each move. */
+  uint32_t servo_quiet_until = 0U;
   /* Clap thresholds are RUNTIME globals (g_clap_ratio/g_clap_abs/g_doa_resid_max),
    * settable from the PC over USB CDC - see the SET command parser. */
   float    vote[DOA_N_AZ] = {0.0f};
@@ -1704,10 +1747,16 @@ void StartTask04(void *argument)
   float    win_max_lev    = 0.0f;      /* max raw level this window              */
   float    win_min_resid  = 1.0f;      /* best (lowest) residual this window     */
   float    win_best_az    = 0.0f;      /* az of the best-fit frame this window   */
+  float    win_best_lev   = 0.0f;      /* level of that best-fit frame           */
+  uint8_t  win_best_clip  = 0U;        /* was that best-fit frame clipped?       */
 
   for (;;)
   {
     if (osMessageQueueGet(result_queueHandle, &res, NULL, portMAX_DELAY) != osOK) { continue; }
+
+    /* Servo-noise blanking: ignore frames captured during/just after a move so the
+     * servo's own noise cannot re-trigger the gate. Don't update the floor either. */
+    if (HAL_GetTick() < servo_quiet_until) { continue; }
 
     /* Echo any clap-gate config just changed from the PC (over USB CDC). printf
      * here (task context) is safe; the CDC parser only sets the dirty flag. Values
@@ -1725,12 +1774,23 @@ void StartTask04(void *argument)
     float az, resid;
     DOA_Compute(res.lag, &az, &resid);     /* discrete az + normalised residual */
 
-    /* Clap onset gate: level must spike above the noise floor (and an absolute
-     * minimum). Non-clap frames just refresh the floor estimate. */
-    uint8_t is_clap = (res.level > g_clap_ratio * bg) && (res.level > g_clap_abs);
-    if (!is_clap)
+    /* Input gate. Two modes (runtime g_voice_mode):
+     *  - clap (0): level must spike above the tracked noise floor AND an absolute
+     *    minimum - only impulsive onsets (hand claps) pass.
+     *  - voice (1): any frame whose band-limited energy clears the absolute floor
+     *    counts, so continuous speech is voted on and the camera follows a talker. */
+    uint8_t accept;
+    if (g_voice_mode)
     {
-      bg += CLAP_BG_ALPHA * (res.level - bg);   /* EMA track background */
+      accept = (res.level > g_clap_abs);               /* simple voice-activity gate */
+    }
+    else
+    {
+      accept = (res.level > g_clap_ratio * bg) && (res.level > g_clap_abs);
+    }
+    if (!accept)
+    {
+      bg += CLAP_BG_ALPHA * (res.level - bg);   /* EMA track background (silence) */
     }
 
     /* Track this window's loudest frame and best fit for the debug print. */
@@ -1738,10 +1798,15 @@ void StartTask04(void *argument)
       float ratio = (bg > 1e-20f) ? (res.level / bg) : 0.0f;
       if (ratio > win_peak_ratio)     { win_peak_ratio = ratio; }
       if (res.level > win_max_lev)    { win_max_lev = res.level; }
-      if (resid < win_min_resid)      { win_min_resid = resid; win_best_az = az; }
+      if (resid < win_min_resid)      { win_min_resid = resid; win_best_az = az;
+                                        win_best_lev = res.level; win_best_clip = res.clipped; }
     }
 
-    if (is_clap && (resid < g_doa_resid_max))
+    /* Vote every frame that clears the gate and fits the table. Clipped frames are
+     * NOT dropped: when speaking loudly almost every frame clips, so dropping them
+     * starved the vote and the camera never moved. Their DOA is noisier but on
+     * average still points at the talker; the 1-second window + decay average it. */
+    if (accept && (resid < g_doa_resid_max))
     {
       uint32_t idx = (uint32_t)lroundf(az / DOA_AZ_STEP) % DOA_N_AZ;
       vote[idx] += (1.0f - resid);         /* weight cleaner matches more       */
@@ -1751,18 +1816,33 @@ void StartTask04(void *argument)
     if ((res.seq - win_start) >= DOA_WIN_BLOCKS)   /* 1-second window elapsed    */
     {
       win_start = res.seq;
-      if (n_acc > 0U)
+      /* Voice gives only ~1 well-fitting frame per second (syllables, pauses), so
+       * one accepted frame is enough to steer; the decay accumulator + 25% plurality
+       * + servo dead-band keep it from chasing a single stray frame. */
+      uint32_t need_acc = 1U;
+      if (n_acc >= need_acc)
       {
-        /* dominant direction = most-voted over the last second */
+        /* dominant direction = most-voted (plurality) over the decayed window */
         uint32_t best = 0U;
-        float    best_v = -1.0f;
+        float    best_v = -1.0f, total_v = 0.0f;
         for (uint32_t a = 0U; a < DOA_N_AZ; a++)
         {
+          total_v += vote[a];
           if (vote[a] > best_v) { best_v = vote[a]; best = a; }
         }
+        /* Voice DOA is naturally spread, so the plurality winner only gets ~25-30%.
+         * Require a light plurality (>=25%) rather than a strict majority, else the
+         * camera would never move. Temporal decay + the servo dead-band keep it from
+         * jittering between near-equal directions. */
+        uint8_t steer = (total_v > 0.0f) && (best_v >= 0.25f * total_v);
         g_doa_az = g_doa_angles[best];
         g_doa_el = 0.0f;
-        if (g_servo_auto) { Servo_PointToAzimuth(g_doa_az); }   /* aim camera (unless manual test) */
+        if (g_servo_auto && (!g_voice_mode || steer))
+        {
+          Servo_PointToAzimuth(g_doa_az);                 /* aim camera (blocks while moving) */
+          osMessageQueueReset(result_queueHandle);        /* drop frames captured while moving */
+          servo_quiet_until = HAL_GetTick() + SERVO_SETTLE_MS;  /* blank the settle period   */
+        }
         int32_t azi = (int32_t)lroundf(g_doa_az);
         printf("DOA seq=%lu az=%ld (cam target, servo=%ld, %lu clap frames)\r\n",
                (unsigned long)res.seq, (long)azi,
@@ -1775,15 +1855,31 @@ void StartTask04(void *argument)
          * best-fit frame so the host always has an angle. "live" flags that it was
          * NOT a confirmed clap. peakRatio/level kept for gate tuning (x1e3 / x1e6). */
         int32_t azl = (int32_t)lroundf(win_best_az);
-        printf("DOA seq=%lu az=%ld live resid=%ld peakRatio=%ld need=%ld maxLev_u=%ld\r\n",
+        /* bestLev_u / bestClip = level & clip flag of the SAME frame that gave the
+         * best fit (win_min_resid), so we can see if the best-fitting frame clears
+         * the abs gate. absNeed_u = g_clap_abs in the same x1e6 units. */
+        printf("DOA seq=%lu az=%ld live resid=%ld peakRatio=%ld maxLev_u=%ld bestLev_u=%ld bestClip=%u absNeed_u=%ld\r\n",
                (unsigned long)res.seq, (long)azl,
                (long)lroundf(win_min_resid  * 1000.0f),
                (long)lroundf(win_peak_ratio * 1000.0f),
-               (long)lroundf(g_clap_ratio   * 1000.0f),
-               (long)lroundf(win_max_lev * 1000000.0f));
+               (long)lroundf(win_max_lev * 1000000.0f),
+               (long)lroundf(win_best_lev * 1000000.0f),
+               (unsigned)win_best_clip,
+               (long)lroundf(g_clap_abs * 1000000.0f));
       }
       win_peak_ratio = 0.0f; win_max_lev = 0.0f; win_min_resid = 1.0f; win_best_az = 0.0f;
-      for (uint32_t a = 0U; a < DOA_N_AZ; a++) { vote[a] = 0.0f; }
+      win_best_lev = 0.0f; win_best_clip = 0U;
+      /* Voice mode: decay votes instead of clearing them, so a steady talker keeps
+       * accumulating in one direction (temporal smoothing) while stray frames fade.
+       * Clap mode: hard-reset each window for crisp per-clap response. */
+      if (g_voice_mode)
+      {
+        for (uint32_t a = 0U; a < DOA_N_AZ; a++) { vote[a] *= VOTE_DECAY; }
+      }
+      else
+      {
+        for (uint32_t a = 0U; a < DOA_N_AZ; a++) { vote[a] = 0.0f; }
+      }
       n_acc = 0U;
     }
 #else

@@ -39,6 +39,7 @@ extern volatile float   g_clap_ratio;
 extern volatile float   g_clap_abs;
 extern volatile float   g_doa_resid_max;
 extern volatile uint8_t g_cfg_dirty;
+extern volatile uint8_t g_voice_mode;
 
 /* Manual servo command (debug): "SERVO 45" aims the camera at 45 deg directly,
  * bypassing DOA. "AUTO 0"/"AUTO 1" stops/resumes DOA driving the servo. */
@@ -61,6 +62,12 @@ static void CDC_ParseCommand(const char *s)
   if (strncmp(s, "AUTO ", 5) == 0)
   {
     g_servo_auto = (uint8_t)(strtol(s + 5, NULL, 10) != 0);
+    return;
+  }
+  if (strncmp(s, "VOICE ", 6) == 0)            /* VOICE 1 = follow speech, 0 = clap */
+  {
+    g_voice_mode = (uint8_t)(strtol(s + 6, NULL, 10) != 0);
+    g_cfg_dirty = 1U;
     return;
   }
   if (strncmp(s, "SET ", 4) != 0) { return; }
