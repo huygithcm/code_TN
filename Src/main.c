@@ -1063,14 +1063,11 @@ void HAL_SAI_RxCpltCallback(SAI_HandleTypeDef *hsai)
  * (Re-run the test if the board is re-wired; only this array needs editing.) */
 static const uint8_t MIC_REMAP[NUM_MIC_CHANNELS] = { 0U, 1U, 7U, 6U, 5U, 4U, 2U, 3U };
 
-/* Per-mic sensitivity normalisation, indexed by LOGICAL slot (Mic1..Mic8 order,
- * same column order as tools/test_mic_order.py). Measured from ambient RMS via
- * the calibration sweep: gain[k] = median(RMS) / RMS[k]. Mic6 (slot5) reads
- * ~3x hotter than the others, so it is attenuated to ~0.33. Re-measure and
- * update if mics/wiring change. */
-static const float MIC_GAIN[NUM_MIC_CHANNELS] = {
-  1.1874f, 0.8557f, 1.1132f, 1.0532f, 0.3341f, 0.9961f, 1.0040f, 0.9541f
-};
+/* No per-mic gain normalisation: under a real signal all 8 mics measure within
+ * ~1.5x of each other, so their true sensitivities are essentially equal. The
+ * earlier ambient-RMS calibration was invalid - quiet-room RMS is dominated by
+ * each mic's own noise floor, not a uniform sound field, so it over-attenuated
+ * one channel. GCC-PHAT whitens magnitude anyway, so DOA barely depends on gain. */
 
 /* Deinterleave one stereo pair's half-buffer into the two per-mic arrays.
  * SAI 24-bit data is MSB-left-justified in a 32-bit slot, so the signed 24-bit
@@ -1093,8 +1090,8 @@ static void Deinterleave_Pair(uint32_t off, uint8_t pair)
     int32_t rr = r_sign * (int32_t)(int16_t)(src[2U * i + 1U] & 0xFFFF);
     mic_raw[ld][i]  = rl;
     mic_raw[rd][i]  = rr;
-    mic_data[ld][i] = (float)rl * (1.0f / 8388608.0f) * MIC_GAIN[ld];
-    mic_data[rd][i] = (float)rr * (1.0f / 8388608.0f) * MIC_GAIN[rd];
+    mic_data[ld][i] = (float)rl * (1.0f / 8388608.0f);
+    mic_data[rd][i] = (float)rr * (1.0f / 8388608.0f);
   }
 }
 
