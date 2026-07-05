@@ -1103,36 +1103,36 @@ static void Deinterleave_Pair(uint32_t off, uint8_t pair)
   /* Polarity inversion is a property of the PHYSICAL capture channel: mics on
    * ch3 (SAI1-B slot 1) and ch6 (SAI2-B slot 0) are wired inverted; negate to
    * restore phase alignment (needed for GCC-PHAT). Keyed on capture ch, not slot. */
+  /* Per-capture-channel polarity. ch3, ch6 are wired inverted; ch5 (Mic6) is added
+   * so pair2's TDOA sign matches the table - measured with a source at a known 270deg
+   * the pair2 lag came out sign-flipped (+3 vs expected -3.7). */
   const int32_t l_sign = (l == 6U) ? -1 : 1;
-  const int32_t r_sign = (r == 3U) ? -1 : 1;
-  /* Continuous 16-bit overflow UNWRAP (state persists across the contiguous circular
-   * DMA). A higher-output mic (the different type on Mic1/Mic2) exceeds the 16-bit
-   * sample range and wraps at the +-32768 boundary, decorrelating it from the array.
-   * Track +-65536 jumps and add them back to reconstruct the true wider waveform
-   * (verified: coherence 0.8 -> 1.0, lag -> physical). Must be CONTINUOUS across
-   * frames - a per-frame reset loses the trajectory and coherence drops. The offset
-   * is clamped to +-UW_OFF_MAX so a rare stray jump cannot drift it without bound;
-   * DOA is unaffected by any residual DC because GCC-PHAT/the clap HPF remove the
-   * mean. Low-level mics never jump, so they pass through unchanged. */
-#define UW_OFF_MAX (1 << 20)
-  static int16_t uw_prev[NUM_MIC_CHANNELS] = {0};
-  static int32_t uw_off[NUM_MIC_CHANNELS]  = {0};
+  const int32_t r_sign = (r == 3U || r == 5U) ? -1 : 1;
+  /* pair0 (ch0=Mic1, ch1=Mic2, SAI1) uses a different, higher-output mic type that
+   * exceeds the 16-bit slot and wraps at +-32768 (verified: ~1800 wraps/frame, std
+   * ~11). Those two SAI1 channels carry a correctly sign-extended 24-bit sample
+   * (high byte 0xFF for negatives), so read them as full signed 24-bit - no wrap,
+   * coherence restored. The other channels fit in 16 bits (and SAI2 has a broken
+   * bit23), so they keep the 16-bit path. GCC-PHAT normalises amplitude, so the
+   * larger numeric range of pair0 does not need rescaling. */
+  uint8_t wide = (pair == 0U);
   for (uint32_t i = 0U; i < AUDIO_BLOCK_SAMPLES; i++)
   {
-    int16_t vl = (int16_t)(src[2U * i] & 0xFFFF);
-    int16_t vr = (int16_t)(src[2U * i + 1U] & 0xFFFF);
-    if      ((int32_t)vl - uw_prev[l] >  40000) { uw_off[l] -= 65536; }
-    else if ((int32_t)vl - uw_prev[l] < -40000) { uw_off[l] += 65536; }
-    if      ((int32_t)vr - uw_prev[r] >  40000) { uw_off[r] -= 65536; }
-    else if ((int32_t)vr - uw_prev[r] < -40000) { uw_off[r] += 65536; }
-    if (uw_off[l] >  UW_OFF_MAX) { uw_off[l] =  UW_OFF_MAX; }
-    if (uw_off[l] < -UW_OFF_MAX) { uw_off[l] = -UW_OFF_MAX; }
-    if (uw_off[r] >  UW_OFF_MAX) { uw_off[r] =  UW_OFF_MAX; }
-    if (uw_off[r] < -UW_OFF_MAX) { uw_off[r] = -UW_OFF_MAX; }
-    uw_prev[l] = vl;
-    uw_prev[r] = vr;
-    int32_t rl = l_sign * ((int32_t)vl + uw_off[l]);
-    int32_t rr = r_sign * ((int32_t)vr + uw_off[r]);
+    int32_t rl, rr;
+    if (wide)
+    {
+      int32_t sl = src[2U * i]      & 0x00FFFFFF;
+      int32_t sr = src[2U * i + 1U] & 0x00FFFFFF;
+      if (sl & 0x00800000) { sl -= 0x01000000; }
+      if (sr & 0x00800000) { sr -= 0x01000000; }
+      rl = l_sign * sl;
+      rr = r_sign * sr;
+    }
+    else
+    {
+      rl = l_sign * (int32_t)(int16_t)(src[2U * i] & 0xFFFF);
+      rr = r_sign * (int32_t)(int16_t)(src[2U * i + 1U] & 0xFFFF);
+    }
     mic_raw[ld][i]  = rl;
     mic_raw[rd][i]  = rr;
     mic_data[ld][i] = (float)rl * (1.0f / 8388608.0f);
@@ -1339,20 +1339,31 @@ int32_t GCC_PHAT(const float *a, const float *b)
     if (gcc_corr[idx] > maxVal) { maxVal = gcc_corr[idx]; maxIdx = idx; }
   }
 
-  /* TASK-11: parabolic interpolation around the peak for a sub-sample lag. The
-   * array is tiny (max delay ~2.7 samples), so integer lags are too coarse for a
-   * meaningful angle; fitting a parabola to the 3 points recovers the fraction.
-   * gcc_corr is circular (length FFT_SIZE), so neighbours wrap around. */
-  uint32_t im1 = (maxIdx == 0U) ? (FFT_SIZE - 1U) : (maxIdx - 1U);
-  uint32_t ip1 = (maxIdx + 1U == FFT_SIZE) ? 0U : (maxIdx + 1U);
-  float ym1 = gcc_corr[im1], y0 = gcc_corr[maxIdx], yp1 = gcc_corr[ip1];
-  float denom = ym1 - 2.0f * y0 + yp1;
-  float delta = (fabsf(denom) > 1e-12f) ? (0.5f * (ym1 - yp1) / denom) : 0.0f;
-  if (delta > 1.0f)  { delta = 1.0f; }
-  if (delta < -1.0f) { delta = -1.0f; }
-
   int32_t lag = (int32_t)maxIdx;
   if (lag > (int32_t)(FFT_SIZE / 2U)) { lag -= (int32_t)FFT_SIZE; }
+
+  /* TASK-11: SUB-SAMPLE refinement by PHASE-SLOPE. The integer peak above is coarse;
+   * for a whitened (PHAT) cross-spectrum the true delay D gives a linear phase
+   * phi_k = -2*pi*k*D/FFT_SIZE. Removing the integer part (lag) leaves a small
+   * residual phase psi_k = -2*pi*k*delta/FFT_SIZE; a least-squares slope of psi_k
+   * over ALL in-band bins recovers delta with far lower variance than a 3-point
+   * parabola (uses ~200 bins instead of 3). |delta|<0.5 keeps psi within +/-pi so no
+   * unwrapping is needed. */
+  const float w = 6.2831853f / (float)FFT_SIZE;   /* 2*pi / N */
+  float sum_kk = 0.0f, sum_kpsi = 0.0f;
+  for (uint32_t k = GCC_BIN_LO; k <= GCC_BIN_HI; k++)
+  {
+    float re = gcc_r[2U * k], im = gcc_r[2U * k + 1U];
+    float psi = atan2f(im, re) + w * (float)k * (float)lag;  /* residual phase */
+    if (psi >  3.14159265f) { psi -= 6.2831853f; }           /* guard wrap */
+    if (psi < -3.14159265f) { psi += 6.2831853f; }
+    sum_kk   += (float)k * (float)k;
+    sum_kpsi += (float)k * psi;
+  }
+  float delta = (sum_kk > 1e-6f) ? (-(sum_kpsi / sum_kk) / w) : 0.0f;
+  if (delta >  1.0f) { delta =  1.0f; }
+  if (delta < -1.0f) { delta = -1.0f; }
+
   g_last_frac = (float)lag + delta;
   return lag;
 }
@@ -1462,31 +1473,36 @@ static const float g_doa_table[DOA_N_AZ][DOA_NPAIRS] = {
   */
 void DOA_Compute(const float *lag_f, float *az_deg, float *resid)
 {
-  /* Robust match: sum the squared errors over all 4 opposite pairs but DROP THE
-   * WORST one (use best 3 of 4). Now that the 16-bit unwrap restored Mic1/Mic2, no
-   * pair is permanently bad, but any single pair can go momentarily noisy (Mic3/Mic7
-   * still weaker); ignoring the worst pair per candidate keeps one bad pair from
-   * dragging the estimate. */
+  /* EXCLUDE pair0 (Mic1-Mic2): they are a different, much more sensitive mic type
+   * that mismatches the other six, so match on the 3 remaining pairs only. The 24-bit
+   * read for pair0 is kept in Deinterleave_Pair for when a matched pair is fitted -
+   * then set DOA_SKIP_PAIR >= DOA_NPAIRS to bring pair0 back in. */
+#define DOA_SKIP_PAIR 0U
   uint32_t best_a = 0U;
   float    best_e = 1e30f;
+  uint32_t npairs_used = 0U;
   for (uint32_t a = 0U; a < DOA_N_AZ; a++)
   {
-    float e_full = 0.0f, e_max = 0.0f;
+    float e = 0.0f;
+    npairs_used = 0U;
     for (uint32_t k = 0U; k < DOA_NPAIRS; k++)
     {
+      if (k == DOA_SKIP_PAIR) { continue; }
       float d = lag_f[k] - g_doa_table[a][k];
-      float ek = d * d;
-      e_full += ek;
-      if (ek > e_max) { e_max = ek; }
+      e += d * d;
+      npairs_used++;
     }
-    float e = e_full - e_max;                   /* best (DOA_NPAIRS-1) pairs */
     if (e < best_e) { best_e = e; best_a = a; }
   }
-  *az_deg = g_doa_angles[best_a];
+  /* Front/back correction: measured az came out a consistent 180deg off the true
+   * source (true 90 -> 270, true 270 -> 90), i.e. a global TDOA-sign convention flip.
+   * Rotate the discrete result by 180deg to match the physical bearing. */
+  uint32_t best_flipped = (best_a + (DOA_N_AZ / 2U)) % DOA_N_AZ;
+  *az_deg = g_doa_angles[best_flipped];
 
-  /* Normalised residual: divide by ((npairs-1) × max_lag²); max_lag = Fs·2R/C. */
+  /* Normalised residual: divide by (pairs_used × max_lag²); max_lag = Fs·2R/C. */
   float max_lag = ((float)AUDIO_FS_HZ * 2.0f * MIC_ARRAY_RADIUS_M) / C_SOUND_MPS;
-  float norm_e  = best_e / ((float)(DOA_NPAIRS - 1U) * max_lag * max_lag + 1e-10f);
+  float norm_e  = best_e / ((float)npairs_used * max_lag * max_lag + 1e-10f);
   g_doa_err = norm_e;
   *resid    = norm_e;
 }
