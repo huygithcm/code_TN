@@ -139,17 +139,18 @@ class DoaReader(threading.Thread):
                     continue
                 sm = re.search(r"seq\s*=\s*(\d+)", line)
                 m = DOA_RE.search(line)
-                if m:
+                # Chi nhan huong da XAC NHAN (dong "cam target" = tieng noi/clap).
+                # Bo qua dong "live" (goc doan tam thoi) -> khong ve mui ten xanh nua.
+                if m and ("live" not in line):
                     self.az = float(m.group(1)) % 360.0
                     self.seq = int(sm.group(1)) if sm else None
                     self.last_update = time.time()
-                    self.is_live = ("live" in line)   # goc tuong doi, chua clap
-                    if not self.is_live:
-                        # clap xac nhan -> luu thanh nguon am (cham)
-                        self.detections.append(self.az)
-                        del self.detections[:-MAX_DETECTIONS]
-                    print(f"  -> az={self.az:.0f}{' live' if self.is_live else ' CLAP'}", flush=True)
+                    self.is_live = False
+                    self.detections.append(self.az)      # luu thanh nguon am (cham)
+                    del self.detections[:-MAX_DETECTIONS]
+                    print(f"  -> az={self.az:.0f} VOICE", flush=True)
                 else:
+                    # dong "live" hoac khong khop -> chi cap nhat nhip song (Listening)
                     self.hb_seq = int(sm.group(1)) if sm else None
                     self.last_hb = time.time()
 
@@ -259,18 +260,18 @@ def main():
             arrow.xy = tip
             arrow.set_position((0, 0))
             stale = (time.time() - reader.last_update) > 3.0
-            live = getattr(reader, "is_live", False)
-            # mau: xam=cu, xanh=goc live (chua clap), do=clap xac nhan
-            color = "0.6" if stale else ("royalblue" if live else "crimson")
+            # mau: xam = huong cu (qua 3s khong co tieng noi moi), do = huong xac nhan
+            color = "0.6" if stale else "crimson"
             arrow.arrow_patch.set_color(color)
+            arrow.arrow_patch.set_visible(True)
             seq = f" (seq={reader.seq})" if reader.seq is not None else ""
-            kind = "live" if live else "CLAP"
             servo = az_to_servo(az)        # cung cong thuc firmware -> doi chieu
-            txt.set_text(f"az: {az:.0f} deg  ->  servo: {servo:.0f} deg [{kind}]{seq}"
+            txt.set_text(f"az: {az:.0f} deg  ->  servo: {servo:.0f} deg [VOICE]{seq}"
                          + ("  [cu]" if stale else ""))
             txt.set_color(color)
         else:
-            # chua co clap nao -> hien nhip song de biet dang ket noi
+            # chua co tieng noi nao -> an mui ten, hien nhip song de biet dang ket noi
+            arrow.arrow_patch.set_visible(False)
             hb = getattr(reader, "hb_seq", None)
             alive = (time.time() - getattr(reader, "last_hb", 0.0)) < 3.0
             if hb is not None and alive:
