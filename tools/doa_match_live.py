@@ -6,12 +6,14 @@ doa_match_live.py - Xem REALTIME buoc "so sanh bang de ra goc" cua DOA.
 Doc luong USB CDC raw (RAW1, PID_5740). Moi ~1s:
   1. Tinh 4 TDOA cap doi tam (band-limited GCC-PHAT + phase-slope, khop firmware).
   2. So voi bang g_doa_table (16 huong 22.5deg): residual moi huong.
-  3. Hien bang residual + huong THANG (drop-worst 1 cap nhu firmware).
+  3. Hien bang residual + huong THANG (dung CA 4 cap, khong hieu chinh 180deg -
+     khop firmware moi: tat ca mic cung loai, khong dao pha).
 
-Luong = mic_raw[slot] da co san polarity + doc 24-bit tu firmware, nen lag khop.
+Luong = mic_raw[slot] doc 24-bit tu firmware (khong con dao pha), nen lag khop.
 
-CACH DUNG:  python tools/doa_match_live.py         (tu dong tim cong)
-            python tools/doa_match_live.py COM12
+CACH DUNG:  python tools/doa_match_live.py            (tu dong tim cong, chay lien tuc)
+            python tools/doa_match_live.py COM7
+            python tools/doa_match_live.py COM7 3      (chay 3 cua so ~3s roi thoat)
 Phu thuoc: pyserial, numpy
 """
 import sys, numpy as np
@@ -56,7 +58,7 @@ def gcc_lag(a,b):
     n=1
     while n<2*len(a): n*=2
     A=np.fft.rfft(a-a.mean(),n); B=np.fft.rfft(b-b.mean(),n)
-    R=A*np.conj(B); f=np.fft.rfftfreq(n,1/FS)
+    R=np.conj(A)*B; f=np.fft.rfftfreq(n,1/FS)   # conj(Xa)*Xb - khop dau GCC_PHAT firmware
     band=(f>=BAND[0])&(f<=BAND[1])
     Rw=np.where(band, R/(np.abs(R)+1e-9), 0.0)
     cc=np.fft.irfft(Rw,n); m=6
@@ -71,13 +73,18 @@ def gcc_lag(a,b):
     return L+d
 
 def main():
-    port=find_port(sys.argv[1] if len(sys.argv)>1 else None)
+    # arg: ten cong (COMx) va/hoac so nguyen = so cua so roi thoat (0/khong = chay lien tuc).
+    port=None; nwin=0
+    for a in sys.argv[1:]:
+        if a.isdigit(): nwin=int(a)
+        else: port=a
+    port=find_port(port)
     if not port: sys.exit("Khong tim thay cong CDC PID_5740")
     ser=serial.Serial(port,115200,timeout=1)
     try: ser.set_buffer_size(rx_size=4*1024*1024)
     except: pass
-    print(f"Doc {port} ... Ctrl+C de thoat")
-    buf=bytearray(); win=[]
+    print(f"Doc {port} ... " + (f"{nwin} cua so roi thoat" if nwin else "Ctrl+C de thoat"))
+    buf=bytearray(); win=[]; done=0
     try:
         while True:
             pl=read_frame(ser,buf)
@@ -89,10 +96,11 @@ def main():
             win.append(lags)
             if len(win)<16: continue
             med=np.median(np.array(win),axis=0); win=[]
-            # residual moi huong - LOAI pair0 (Mic1/Mic2), dung pair1,2,3 (khop firmware)
+            # residual moi huong - dung CA 4 cap (khop firmware moi: DOA_SKIP_PAIR=DOA_NPAIRS,
+            # tat ca mic cung loai). KHONG con hieu chinh 180deg (da bo dao pha trong firmware).
             d2=(TABLE-med)**2
-            resid=d2[:,1:].sum(1)                    # bo pair0
-            best=(int(np.argmin(resid))+8)%16        # +180 deg front/back correction
+            resid=d2.sum(1)                          # ca 4 cap doi tam
+            best=int(np.argmin(resid))               # goc tho ra thang tu khop bang
 
             # ve bang
             lines=[]
@@ -107,8 +115,11 @@ def main():
                 lines.append(f"{AZ[a]:6.1f} | {exp} | {resid[a]:6.2f} {bar}{mark}")
             lines.append("")
             lines.append(f"=> GOC RA: {AZ[best]:.1f} deg  (resid={resid[best]:.2f})")
-            sys.stdout.write("\033[2J\033[H"+"\n".join(lines)+"\n")
+            done+=1
+            clear="" if nwin else "\033[2J\033[H"   # che do gioi han: khong xoa man (de luu log)
+            sys.stdout.write(clear+"\n".join(lines)+"\n")
             sys.stdout.flush()
+            if nwin and done>=nwin: break
     except KeyboardInterrupt:
         print("\nThoat.")
     finally:

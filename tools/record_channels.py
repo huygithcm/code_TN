@@ -81,7 +81,13 @@ def read_frames(port, seconds):
 
 
 def to_int16(data):
-    """int32 (~16-bit range) -> int16, clip an toan."""
+    """int32 -> int16 nghe duoc. Mic moi la loai 24-bit (dinh ~1M), vuot xa dai
+    16-bit; neu clip cung se keo bien toan bo -> WAV vo dung. Khi dinh vuot 16-bit,
+    co gian TOAN BO cac kenh bang MOT he so chung (giu dung ti le muc giua cac mic)
+    ve ~+-32000. Neu du lieu von nam trong dai 16-bit (mic cu) thi giu nguyen."""
+    peak = float(np.max(np.abs(data))) if data.size else 0.0
+    if peak > 32767.0:
+        return np.round(data * (32000.0 / peak)).astype("<i2")
     return np.clip(data, -32768, 32767).astype("<i2")
 
 
