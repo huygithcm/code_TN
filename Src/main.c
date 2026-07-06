@@ -94,6 +94,20 @@
 #define DOA_AZ_STEP          22.5f                        /* angular resolution (deg)   */
 #define DOA_SELFTEST_AZ      45.0f                        /* synthetic source azimuth (one of the 16 table dirs) */
 
+/* TDOA estimator selector (both feed the SAME g_doa_table min-SSE match + servo):
+ *   GCCPHAT  - frequency-domain GCC-PHAT + phase-slope (whitened, robust to colour/
+ *              reverb; ~17 ms/frame incl. FFTs). This is the default.
+ *   CRSSCOR  - Mic_Array (Phan Le Son) TIME-DOMAIN cross-correlation (no FFT/whitening,
+ *              +-CRSSCOR_SEARCH sample search, optional parabolic sub-sample). Much
+ *              cheaper (<1 ms, and skips the per-frame FFT), but un-whitened -> needs a
+ *              high-pass (CRSSCOR_HPF) to keep 50 Hz hum from biasing the peak.
+ * Flip this define + rebuild to A/B the two methods on the same rig. */
+#define DOA_METHOD_GCCPHAT   0
+#define DOA_METHOD_CRSSCOR   1
+#ifndef DOA_METHOD
+#define DOA_METHOD           DOA_METHOD_CRSSCOR   /* experiment/micarray-tdoa: try time-domain */
+#endif
+
 /* TASK-09: FreeRTOS task notification flags (FFT_Task waits on these). */
 #define FLAG_FFT             (1UL << 0)                   /* a fresh half is ready      */
 #define FLAG_USB             (1UL << 1)                   /* build+send a USB raw frame */
@@ -344,6 +358,9 @@ static uint32_t FFT_PeakBin(const float *mag, float *peakVal);
 int32_t GCC_PHAT(const float *a, const float *b);
 void GCC_SelfTest(void);
 void GCC_ProcessPairs(void);
+#if DOA_METHOD == DOA_METHOD_CRSSCOR
+void CrssCor_ProcessPairs(void);   /* Mic_Array time-domain TDOA (alt. to GCC_ProcessPairs) */
+#endif
 #if DOA_ENABLE
 void DOA_Compute(const float *lag_f, float *az_deg, float *resid);
 void DOA_SelfTest(void);
@@ -1428,6 +1445,93 @@ void GCC_ProcessPairs(void)
   g_gcc_us = (DWT->CYCCNT - t0) / 64U;   /* cycles @ 64 MHz -> us */
 }
 
+#if DOA_METHOD == DOA_METHOD_CRSSCOR
+/* ============ Mic_Array (Phan Le Son) TIME-DOMAIN cross-correlation TDOA ==========
+ * Port of CrssCor()/DOACalc() from Mic_Array's DelayEstimation.c, adapted to code_TN
+ * (float mic_data, 4 opposite pairs, +-CRSSCOR_SEARCH sample search). Feeds the SAME
+ * g_doa_lag_f[] -> DOA_Compute -> g_doa_table match as GCC-PHAT, so only the estimator
+ * changes. No FFT, no PHAT whitening -> cheap but hum-sensitive, hence the high-pass. */
+#define CRSSCOR_SEARCH     5U     /* +-5 samples (physical max ~3.7 for the 80mm array) */
+#define CRSSCOR_HPF        1      /* 1 = DC/hum-block before correlation (no whitening) */
+#define CRSSCOR_PARABOLIC  1      /* 1 = 3-point parabolic sub-sample refine on the peak */
+
+#if CRSSCOR_HPF
+/* 1st-order high-pass y[n]=a*(y[n-1]+x[n]-x[n-1]); a=0.90 -> fc ~250 Hz (matches the
+ * GCC band-low). Kills DC drift + attenuates 50 Hz mains hum, which would otherwise
+ * dominate the un-whitened cross-correlation and flip the DOA (see BUG history). */
+__attribute__((section(".DTCMSection"), aligned(32), used)) static float cc_ha[AUDIO_BLOCK_SAMPLES];
+__attribute__((section(".DTCMSection"), aligned(32), used)) static float cc_hb[AUDIO_BLOCK_SAMPLES];
+static void CrssCor_HP(const float *x, float *y)
+{
+  const float a = 0.90f;
+  float xp = x[0], yp = 0.0f;
+  y[0] = 0.0f;
+  for (uint32_t n = 1U; n < AUDIO_BLOCK_SAMPLES; n++)
+  {
+    yp = a * (yp + x[n] - xp);
+    xp = x[n];
+    y[n] = yp;
+  }
+}
+#endif
+
+/* Cross-correlation lag between a and b over +-CRSSCOR_SEARCH samples.
+ * r(L) = sum_n a[n]*b[n+L]; peak L = lag with a arriving before b by L samples -
+ * SAME sign convention as GCC_PHAT (conj(Xa)*Xb) so g_doa_table is reused as-is.
+ * (Fixed length -> the /(N-|L|) normalisation is ~constant over the tiny search
+ * window and does not move the argmax, so it is dropped.) */
+static float CrssCor_Lag(const float *a, const float *b)
+{
+  const float *pa = a, *pb = b;
+#if CRSSCOR_HPF
+  CrssCor_HP(a, cc_ha); CrssCor_HP(b, cc_hb); pa = cc_ha; pb = cc_hb;
+#endif
+  float    r[2U * CRSSCOR_SEARCH + 1U];
+  float    best = -1e30f;
+  int32_t  bestL = 0;
+  for (int32_t L = -(int32_t)CRSSCOR_SEARCH; L <= (int32_t)CRSSCOR_SEARCH; L++)
+  {
+    float s = 0.0f;
+    if (L >= 0)
+    {
+      for (uint32_t n = 0U; n + (uint32_t)L < AUDIO_BLOCK_SAMPLES; n++) { s += pa[n] * pb[n + (uint32_t)L]; }
+    }
+    else
+    {
+      uint32_t m = (uint32_t)(-L);
+      for (uint32_t n = 0U; n + m < AUDIO_BLOCK_SAMPLES; n++) { s += pa[n + m] * pb[n]; }
+    }
+    r[L + (int32_t)CRSSCOR_SEARCH] = s;
+    if (s > best) { best = s; bestL = L; }
+  }
+  float frac = 0.0f;
+#if CRSSCOR_PARABOLIC
+  int32_t i = bestL + (int32_t)CRSSCOR_SEARCH;            /* skip the search edges */
+  if ((i > 0) && (i < (int32_t)(2U * CRSSCOR_SEARCH)))
+  {
+    float ym1 = r[i - 1], y0 = r[i], yp1 = r[i + 1];
+    float den = ym1 - 2.0f * y0 + yp1;
+    if (fabsf(den) > 1e-9f) { frac = 0.5f * (ym1 - yp1) / den; }
+    if (frac >  0.5f) { frac =  0.5f; }
+    if (frac < -0.5f) { frac = -0.5f; }
+  }
+#endif
+  return (float)bestL + frac;
+}
+
+/* Drop-in replacement for GCC_ProcessPairs using the time-domain estimator. */
+void CrssCor_ProcessPairs(void)
+{
+  uint32_t t0 = DWT->CYCCNT;
+  for (uint32_t k = 0U; k < GCC_NPAIRS_LIVE; k++)
+  {
+    g_tdoa_lag_f[k] = CrssCor_Lag(mic_data[2U * k], mic_data[2U * k + 1U]);
+    g_tdoa_lag[k]   = (int32_t)lroundf(g_tdoa_lag_f[k]);
+  }
+  g_gcc_us = (DWT->CYCCNT - t0) / 64U;   /* reuse the same timing counter */
+}
+#endif /* DOA_METHOD == DOA_METHOD_CRSSCOR */
+
 #if DOA_ENABLE
 /* TASK-11: physical mic geometry (UCA diameter 80mm, R = 0.040 m). Each SAI pair
  * wires two diametrically opposed mics. With MIC_REMAP applied at deinterleave,
@@ -1717,9 +1821,15 @@ void StartTask02(void *argument)
     g_blocks++;
 
 #if FFT_ENABLE
+#if DOA_METHOD == DOA_METHOD_CRSSCOR
+    CrssCor_ProcessPairs();          /* time-domain TDOA: no per-frame FFT needed */
+#else
     FFT_ProcessAll();
 #if GCC_ENABLE
     GCC_ProcessPairs();
+#endif
+#endif
+#if GCC_ENABLE
     /* Hand the 4 opposite-pair TDOAs to DOA_Task (drop if the queue is full). */
     tdoa_result_t res;
     res.seq = g_blocks;
