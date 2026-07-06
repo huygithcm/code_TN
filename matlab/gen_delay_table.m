@@ -10,15 +10,20 @@
 %         lag_k(az) = (Fs/C) * 2R * cos(az - phi_k)   [mẫu]
 %     Dấu khớp quy ước GCC_PHAT(ch_chẵn, ch_lẻ) trong firmware.
 %
-% Chạy:  gen_delay_table            % dùng tham số mặc định (80mm, 16 hướng)
-%        gen_delay_table(0.026,16)  % R=26mm, 16 hướng (đường kính 52mm)
+% Chạy:  gen_delay_table              % mặc định (80mm, 16 hướng, đơn vị mẫu)
+%        gen_delay_table(0.026,16)    % R=26mm, 16 hướng (đường kính 52mm)
+%        gen_delay_table(0.040,16,4)  % ĐƠN VỊ 1/4 MẪU (resample x4, kiểu Mic_Array)
+%
+% Tham số COEF (hệ số resample, mặc định 1): nhân trễ với COEF -> đơn vị "1/COEF mẫu".
+% COEF=4 sinh bảng g_doa_table_x4 (quarter-sample) khớp CrssCorResample của Mic_Array.
 %
 % In ra: bảng C (dán vào main.c) + bảng MATLAB + lưu CSV.
 
-function gen_delay_table(R, N_AZ)
+function gen_delay_table(R, N_AZ, COEF)
 
     if nargin < 1 || isempty(R),    R    = 0.040;  end   % bán kính UCA (m) -> 80mm
     if nargin < 2 || isempty(N_AZ), N_AZ = 16;     end   % số hướng (16 -> 22.5 deg)
+    if nargin < 3 || isempty(COEF), COEF = 1;      end   % hệ số resample (4 -> 1/4 mẫu)
 
     Fs = 16000;       % tần số lấy mẫu (Hz)
     C  = 343.0;       % vận tốc âm (m/s)
@@ -27,7 +32,7 @@ function gen_delay_table(R, N_AZ)
     az_step = 360 / N_AZ;
     angles  = (0:N_AZ-1) * az_step;          % hướng ứng viên (deg)
     phi     = (0:N_PAIRS-1) * 45;            % góc baseline từng cặp (deg)
-    scale   = (Fs / C) * 2 * R;              % (Fs/C)*2R, trễ cực đại (mẫu)
+    scale   = COEF * (Fs / C) * 2 * R;       % (Fs/C)*2R * COEF, trễ cực đại (đơn vị 1/COEF mẫu)
 
     % --- Tính bảng (N_AZ x N_PAIRS) --------------------------------------
     table = zeros(N_AZ, N_PAIRS);
@@ -42,11 +47,16 @@ function gen_delay_table(R, N_AZ)
     fprintf('  R = %.0f mm (duong kinh %.0f mm), Fs = %d Hz, C = %.0f m/s\n', ...
             R*1e3, 2*R*1e3, Fs, C);
     fprintf('  So huong = %d (buoc %.1f deg), so cap = %d\n', N_AZ, az_step, N_PAIRS);
-    fprintf('  (Fs/C)*2R = %.6f mau (tre cuc dai)\n\n', scale);
+    if COEF == 1
+        unit = 'mau'; arrname = 'g_doa_table';
+    else
+        unit = sprintf('1/%d mau', COEF); arrname = sprintf('g_doa_table_x%d', COEF);
+    end
+    fprintf('  COEF = %d (don vi: %s),  tre cuc dai = %.6f\n\n', COEF, unit, scale);
 
-    % --- In dạng C (dán vào g_doa_table trong main.c) --------------------
-    fprintf('// g_doa_table[%d][%d] - dan vao Src/main.c\n', N_AZ, N_PAIRS);
-    fprintf('static const float g_doa_table[DOA_N_AZ][DOA_NPAIRS] = {\n');
+    % --- In dạng C (dán vào main.c) --------------------------------------
+    fprintf('// %s[%d][%d] - dan vao Src/main.c (don vi: %s)\n', arrname, N_AZ, N_PAIRS, unit);
+    fprintf('static const float %s[DOA_N_AZ][DOA_NPAIRS] = {\n', arrname);
     for a = 1:N_AZ
         fprintf('  { %s },  /* az=%5.1f */\n', ...
                 strjoin(arrayfun(@(v) sprintf('%10.6ff', v), table(a,:), 'uni', 0), ', '), ...
@@ -66,7 +76,11 @@ function gen_delay_table(R, N_AZ)
     fprintf('\n');
 
     % --- Lưu CSV ----------------------------------------------------------
-    fname = sprintf('delay_table_%dk_%dmm_%ddir.csv', round(Fs/1000), round(2*R*1e3), N_AZ);
+    if COEF == 1
+        fname = sprintf('delay_table_%dk_%dmm_%ddir.csv', round(Fs/1000), round(2*R*1e3), N_AZ);
+    else
+        fname = sprintf('delay_table_%dk_%dmm_%ddir_x%d.csv', round(Fs/1000), round(2*R*1e3), N_AZ, COEF);
+    end
     writematrix(table, fname);
     fprintf('Da luu: %s\n', fname);
 end

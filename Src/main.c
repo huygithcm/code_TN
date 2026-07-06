@@ -1468,6 +1468,33 @@ static const float g_doa_table[DOA_N_AZ][DOA_NPAIRS] = {
   {   3.447714f,   1.428090f,  -1.428090f,  -3.447714f },  /* az=337.5 */
 };
 
+/* EXPERIMENT (Mic_Array / Phan Le Son method): same table but in QUARTER-SAMPLE units
+ * (x4), to match a resample-x4 time-domain cross-correlation TDOA (CrssCorResample).
+ * g_doa_table_x4[a][k] = 4 * (Fs/C) * 2R * cos(az - phi_k) = 14.927114 * cos(...).
+ * Pairs with the resample-x4 delay estimator (not yet wired into the firmware DSP -
+ * the live path still uses GCC-PHAT + g_doa_table above). Mirrors the hardcoded
+ * DOA[][] table in Mic_Array's DOA.c, regenerated for THIS geometry (R=40mm, Fs=16k).
+ * marked unused so -Wall stays quiet until the x4 estimator is enabled. */
+__attribute__((unused))
+static const float g_doa_table_x4[DOA_N_AZ][DOA_NPAIRS] = {
+  {  14.927114f,  10.555063f,   0.000000f, -10.555063f },  /* az=  0.0 */
+  {  13.790855f,  13.790855f,   5.712359f,  -5.712359f },  /* az= 22.5 */
+  {  10.555063f,  14.927114f,  10.555063f,   0.000000f },  /* az= 45.0 */
+  {   5.712359f,  13.790855f,  13.790855f,   5.712359f },  /* az= 67.5 */
+  {   0.000000f,  10.555063f,  14.927114f,  10.555063f },  /* az= 90.0 */
+  {  -5.712359f,   5.712359f,  13.790855f,  13.790855f },  /* az=112.5 */
+  { -10.555063f,   0.000000f,  10.555063f,  14.927114f },  /* az=135.0 */
+  { -13.790855f,  -5.712359f,   5.712359f,  13.790855f },  /* az=157.5 */
+  { -14.927114f, -10.555063f,   0.000000f,  10.555063f },  /* az=180.0 */
+  { -13.790855f, -13.790855f,  -5.712359f,   5.712359f },  /* az=202.5 */
+  { -10.555063f, -14.927114f, -10.555063f,   0.000000f },  /* az=225.0 */
+  {  -5.712359f, -13.790855f, -13.790855f,  -5.712359f },  /* az=247.5 */
+  {   0.000000f, -10.555063f, -14.927114f, -10.555063f },  /* az=270.0 */
+  {   5.712359f,  -5.712359f, -13.790855f, -13.790855f },  /* az=292.5 */
+  {  10.555063f,   0.000000f, -10.555063f, -14.927114f },  /* az=315.0 */
+  {  13.790855f,   5.712359f,  -5.712359f, -13.790855f },  /* az=337.5 */
+};
+
 /**
   * @brief  TASK-11 - table-match DOA. The source is assumed to sit at one of the
   *         8 fixed 45-degree directions; pick the table row whose expected lags
