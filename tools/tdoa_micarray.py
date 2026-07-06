@@ -60,6 +60,17 @@ def resample_x4_fft(x):
     return np.real(y)
 
 
+def highpass(x, a=0.90):
+    """1st-order high-pass y[n]=a*(y[n-1]+x[n]-x[n-1]), fc~250Hz - KHOP firmware
+    CrssCor_HP (chong hum 50Hz truoc correlation khong-whitening)."""
+    y = np.empty_like(x)
+    y[0] = 0.0
+    xp = x[0]; yp = 0.0
+    for n in range(1, len(x)):
+        yp = a * (yp + x[n] - xp); xp = x[n]; y[n] = yp
+    return y
+
+
 def crosscorr_lag(a, b, par_res):
     """CrssCor: cross-correlation mien thoi gian, dinh trong +-par_res.
     r(i)=sum a[j+i]*b[j] chuan hoa /(len-|i|); argmax -> lag (a truoc b khi lag>0)."""
@@ -104,7 +115,7 @@ def compute_delays_micarray(x, resample=True):
             q = crosscorr_resample_lag(a_up, x[o], PAR_RES_X4)   # quarter-sample
             d[k] = -(q / COEF)                                   # ve mau + khop dau firmware
         else:
-            d[k] = -crosscorr_lag(x[e], x[o], PAR_RES_1)
+            d[k] = -crosscorr_lag(highpass(x[e]), highpass(x[o]), PAR_RES_1)  # HPF nhu firmware
     return d
 
 

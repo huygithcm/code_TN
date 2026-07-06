@@ -7,9 +7,9 @@ Cua so co 2 panel:
           firmware qua ST-Link VCP (USART3/COM1, 115200):
               DOA seq=1234 az=45 (cam target, 3 clap frames)
   PHAI  - Buoc "so sanh TDOA voi bang" (tinh trong Python tu luong CDC RAW1):
-          4 TDOA cap doi tam (band-limited GCC-PHAT + phase-slope, khop firmware),
-          residual moi trong 16 huong so voi g_doa_table, va huong thang. Sao vang
-          = goc firmware (VCP) de doi chieu firmware vs phan tich.
+          4 TDOA cap doi tam bang Mic_Array TIME-DOMAIN cross-correlation (high-pass
+          + parabol sub-sample, khop firmware CrssCor_Lag), residual moi trong 16
+          huong so voi g_doa_table, va huong thang.
 
 Quy uoc goc: 0 deg = +x (Mic1), nguoc chieu kim (CCW) la duong. Khop Src/main.c:
 tat ca mic cung loai, doc 24-bit, KHONG dao pha, dung CA 4 cap, KHONG hieu chinh 180.
@@ -89,7 +89,7 @@ def az_to_servo(az_deg):
 DOA_RE = re.compile(r"az\s*=\s*(-?\d+(?:\.\d+)?)")
 
 # =========================================================================
-# TDOA <-> bang mau (khop Src/main.c: DOA_Compute + GCC_PHAT)
+# TDOA <-> bang mau (khop Src/main.c: DOA_Compute + CrssCor_Lag, Mic_Array time-domain)
 # =========================================================================
 _HDR = 12; _NCH = 8; _NSAMP = 1024
 _PAYLOAD = _NCH * _NSAMP * 4; _FRAME = _HDR + _PAYLOAD
@@ -101,33 +101,43 @@ AZ_TAB = np.arange(0, 360, 22.5)                # 16 huong ung voi g_doa_angles
 # g_doa_table[a][k] = K*cos(az_a - phi_k)
 DOA_TABLE = np.array([[_K * np.cos(np.deg2rad(a - p)) for p in _PHI] for a in AZ_TAB])
 PAIRS = [(0, 1), (2, 3), (4, 5), (6, 7)]        # slot doi tam; phi=0/45/90/135
-_BAND = (250, 3500)                             # GCC_BIN_LO..HI trong firmware
+CC_SEARCH = 5                                   # +-5 mau (khop CRSSCOR_SEARCH firmware)
 WIN_FRAMES = 16                                 # ~1s: median lag moi cua so (nhu firmware)
 
 
-def gcc_lag(a, b):
-    """band-limited GCC-PHAT + phase-slope sub-sample (khop GCC_PHAT firmware)."""
-    n = 1
-    while n < 2 * len(a):
-        n *= 2
-    A = np.fft.rfft(a - a.mean(), n)
-    B = np.fft.rfft(b - b.mean(), n)
-    R = np.conj(A) * B          # conj(Xa)*Xb - KHOP DAU voi GCC_PHAT firmware
-    f = np.fft.rfftfreq(n, 1 / _FS)
-    band = (f >= _BAND[0]) & (f <= _BAND[1])
-    Rw = np.where(band, R / (np.abs(R) + 1e-9), 0.0)
-    cc = np.fft.irfft(Rw, n)
-    m = 6
-    seg = np.concatenate((cc[-m:], cc[:m + 1]))
-    lags = np.arange(-m, m + 1)
-    L = int(lags[np.argmax(seg)])
-    kk = np.arange(n // 2 + 1)[band]
-    phi = np.angle(Rw[band])
-    psi = phi + 2 * np.pi * kk * L / n
-    psi = (psi + np.pi) % (2 * np.pi) - np.pi
-    d = -(np.sum(kk * psi) / (np.sum(kk * kk) + 1e-9)) / (2 * np.pi / n)
-    d = max(-1, min(1, d))
-    return L + d
+def _highpass(x, a=0.90):
+    """1st-order high-pass y[n]=a*(y[n-1]+x[n]-x[n-1]), fc~250Hz - khop CrssCor_HP firmware."""
+    y = np.empty_like(x)
+    y[0] = 0.0
+    xp = x[0]; yp = 0.0
+    for n in range(1, len(x)):
+        yp = a * (yp + x[n] - xp); xp = x[n]; y[n] = yp
+    return y
+
+
+def crsscor_lag(a, b):
+    """Mic_Array TIME-DOMAIN cross-correlation TDOA - KHOP firmware CrssCor_Lag:
+    high-pass -> r(L)=sum a[n]*b[n+L] trong +-CC_SEARCH -> dinh + parabol sub-sample.
+    Dau khop g_doa_table (a truoc b khi lag>0)."""
+    a = _highpass(a); b = _highpass(b)
+    N = len(a)
+    r = np.empty(2 * CC_SEARCH + 1)
+    for j, L in enumerate(range(-CC_SEARCH, CC_SEARCH + 1)):
+        if L >= 0:
+            r[j] = np.dot(a[:N - L], b[L:])
+        else:
+            m = -L
+            r[j] = np.dot(a[m:], b[:N - m])
+    i = int(np.argmax(r))
+    L = i - CC_SEARCH
+    frac = 0.0
+    if 0 < i < 2 * CC_SEARCH:                    # parabol 3 diem, bo canh
+        ym1, y0, yp1 = r[i - 1], r[i], r[i + 1]
+        den = ym1 - 2 * y0 + yp1
+        if abs(den) > 1e-9:
+            frac = 0.5 * (ym1 - yp1) / den
+        frac = max(-0.5, min(0.5, frac))
+    return L + frac
 
 
 def match_table(lags):
@@ -280,7 +290,7 @@ class TdoaReader(threading.Thread):
                 x = np.frombuffer(pl, dtype="<i4").astype(np.float64).reshape(_NCH, _NSAMP)
                 if np.mean(x[4] ** 2) < 1e4:        # bo khung qua nho
                     continue
-                win.append([gcc_lag(x[a], x[b]) for a, b in PAIRS])
+                win.append([crsscor_lag(x[a], x[b]) for a, b in PAIRS])
                 if len(win) < WIN_FRAMES:
                     continue
                 med = np.median(np.array(win), axis=0)
@@ -316,8 +326,8 @@ class DemoReader:
 # ------------------------------------------------------------------- ve do thi
 def build_plot(with_tdoa=True):
     if with_tdoa:
-        fig, (ax, ax2) = plt.subplots(1, 2, figsize=(12.6, 6.4),
-                                      gridspec_kw={"width_ratios": [1, 1.15]})
+        fig, (ax, ax2) = plt.subplots(1, 2, figsize=(13.0, 7.2),
+                                      gridspec_kw={"width_ratios": [1, 1.05]})
     else:
         fig, ax = plt.subplots(figsize=(6.4, 6.4))
         ax2 = None
@@ -357,29 +367,33 @@ def build_plot(with_tdoa=True):
 
     tdoa = None
     if with_tdoa:
-        # Panel phai: "khop bang" = residmax - resid, chuan hoa [0,1] (1 = tot nhat).
-        xs = np.arange(len(AZ_TAB))
-        bars = ax2.bar(xs, np.zeros(len(AZ_TAB)), color="#4c72b0", width=0.8)
-        ax2.set_ylim(0, 1.05)
-        ax2.set_xticks(xs)
-        ax2.set_xticklabels([f"{a:g}" for a in AZ_TAB], rotation=90, fontsize=7)
-        ax2.set_xlabel("azimuth ung vien (deg)")
-        ax2.set_ylabel("do khop (1 = residual nho nhat)")
-        ax2.set_title("Buoc so sanh TDOA voi bang g_doa_table")
-        ax2.grid(True, axis="y", ls=":", alpha=0.3)
-        # sao vang = goc firmware (VCP) de doi chieu
-        fw_marker, = ax2.plot([], [], marker="*", ms=18, color="gold",
-                              mec="black", mew=0.6, ls="none", zorder=5,
-                              label="goc firmware (VCP)")
-        lag_txt = ax2.text(0.5, 1.14, "", transform=ax2.transAxes, ha="center",
-                           va="top", fontsize=9, family="monospace")
-        res_txt = ax2.text(0.5, -0.30, "Cho du lieu CDC...", transform=ax2.transAxes,
-                           ha="center", va="top", fontsize=11, color="0.5",
+        # Panel phai: BANG g_doa_table (16 hang az x 4 cot pair lag) + cot resid.
+        # Moi hang la 1 huong; moi ~1s to mau tung o pair theo do khop voi T_delay DO,
+        # hang residual nho nhat lam noi bat. Khong con dau sao.
+        ax2.axis("off")
+        ax2.set_title("Buoc so sanh T_delay voi bang g_doa_table")
+        col_labels = ["az", "pair0", "pair1", "pair2", "pair3", "resid"]
+        cell_text = [[f"{AZ_TAB[a]:g}"]
+                     + [f"{DOA_TABLE[a, k]:+.2f}" for k in range(4)]
+                     + ["--"] for a in range(len(AZ_TAB))]
+        tbl = ax2.table(cellText=cell_text, colLabels=col_labels,
+                        loc="center", cellLoc="center")
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(8.5)
+        tbl.scale(1.0, 1.30)
+        for c in range(len(col_labels)):          # header dam
+            hc = tbl[0, c]
+            hc.set_facecolor("#34495e")
+            hc.get_text().set_color("white")
+            hc.get_text().set_fontweight("bold")
+        lag_txt = ax2.text(0.5, 1.05, "T_delay DO: --", transform=ax2.transAxes,
+                           ha="center", va="bottom", fontsize=10.5, family="monospace",
+                           fontweight="bold", color="#1f3b66")
+        res_txt = ax2.text(0.5, -0.03, "Cho du lieu CDC...", transform=ax2.transAxes,
+                           ha="center", va="top", fontsize=12, color="0.5",
                            fontweight="bold")
-        ax2.legend(loc="upper right", fontsize=8, framealpha=0.7)
-        fig.subplots_adjust(top=0.84, bottom=0.22, wspace=0.25)
-        tdoa = dict(ax=ax2, bars=bars, fw_marker=fw_marker,
-                    lag_txt=lag_txt, res_txt=res_txt)
+        fig.subplots_adjust(top=0.86, bottom=0.09, wspace=0.12, left=0.06, right=0.98)
+        tdoa = dict(ax=ax2, tbl=tbl, lag_txt=lag_txt, res_txt=res_txt)
     return fig, ax, arrow, txt, src, tdoa
 
 
@@ -467,31 +481,31 @@ def main():
             src.set_offsets(np.empty((0, 2)))
             src.set_sizes([])
 
-        # ---- panel TDOA ----
+        # ---- panel TDOA: cap nhat bang so sanh ----
         if tdoa is not None and tdoa_reader is not None and tdoa_reader.resid is not None:
-            resid = tdoa_reader.resid
-            rng = resid.max() - resid.min()
-            score = (resid.max() - resid) / (rng + 1e-9)     # 1 = khop nhat
-            best = tdoa_reader.best
-            for i, b in enumerate(tdoa["bars"]):
-                b.set_height(score[i])
-                b.set_color("crimson" if i == best else "#4c72b0")
             med = tdoa_reader.lags
-            exp = DOA_TABLE[best]
+            resid = tdoa_reader.resid
+            best = tdoa_reader.best
+            tbl = tdoa["tbl"]
+            for a in range(len(AZ_TAB)):
+                # to mau tung o pair theo do khop |bang - do|: xanh = sat, trang = lech
+                for k in range(4):
+                    t = min(1.0, abs(DOA_TABLE[a, k] - med[k]) / 2.0)
+                    tbl[a + 1, k + 1].set_facecolor((0.55 + 0.45 * t, 0.85 + 0.15 * t,
+                                                     0.55 + 0.45 * t))
+                tbl[a + 1, 5].get_text().set_text(f"{resid[a]:.2f}")
+                isbest = (a == best)
+                tbl[a + 1, 0].set_facecolor("#ffd24d" if isbest else "white")
+                tbl[a + 1, 5].set_facecolor("#ff9d9d" if isbest else "white")
+                for c in range(6):
+                    tbl[a + 1, c].get_text().set_fontweight("bold" if isbest else "normal")
             tdoa["lag_txt"].set_text(
-                "lag do :  " + "  ".join(f"{v:+5.2f}" for v in med) + "\n"
-                "lag bang: " + "  ".join(f"{v:+5.2f}" for v in exp) + "   (pair0..3)")
+                "T_delay DO (pair0..3):  " + "   ".join(f"{v:+.2f}" for v in med))
             fresh = (time.time() - tdoa_reader.last_update) < 3.0
             tdoa["res_txt"].set_text(
-                f"GOC TDOA: {tdoa_reader.best_az:.1f} deg   "
-                f"resid={resid[best]:.2f}" + ("" if fresh else "   [cu]"))
+                f"=> GOC TDOA: {tdoa_reader.best_az:.1f} deg   resid={resid[best]:.2f}"
+                + ("" if fresh else "   [cu]"))
             tdoa["res_txt"].set_color("crimson" if fresh else "0.6")
-            # sao vang: goc firmware (VCP) tren cung truc
-            if az is not None:
-                fi = int(round((az % 360.0) / 22.5)) % len(AZ_TAB)
-                tdoa["fw_marker"].set_data([fi], [score[fi]])
-            else:
-                tdoa["fw_marker"].set_data([], [])
         elif tdoa is not None and tdoa_reader is not None and not tdoa_reader.ok:
             tdoa["res_txt"].set_text(f"CDC loi: {tdoa_reader.err}")
 
