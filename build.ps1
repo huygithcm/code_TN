@@ -37,47 +37,66 @@ $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 Set-Location $root
 
-# --- 1. Dinh vi STM32CubeIDE ---------------------------------------------
-function Find-CubeIdeRoot {
-    $candidates = @()
-    foreach ($base in @('C:\ST', 'C:\Program Files\STMicroelectronics', "$env:LOCALAPPDATA\Programs")) {
-        if (Test-Path $base) {
-            $candidates += Get-ChildItem $base -Directory -Filter 'STM32CubeIDE*' -ErrorAction SilentlyContinue
-        }
+# --- 1. Dinh vi toolchain (portable — khong hardcode duong dan) -----------
+# Khi tim moi cong cu, thu tu uu tien:
+#   1) Bien moi truong ghi de (STM32CUBEIDE_PATH / STM32CUBEPROG_PATH)
+#   2) Da co san tren PATH (vd toolchain cai rieng)
+#   3) Quet cac thu muc cai dat ST tren MOI o dia co dinh + Program Files
+# Nho vay script chay duoc tren may khac ma khong can sua duong dan trong file.
+
+# Cac thu muc goc co the chua ban cai ST (chi nhung noi dac thu ST de tranh
+# quet toan bo Program Files). Chi tra ve thu muc thuc su ton tai.
+function Get-StSearchRoots {
+    $roots = @()
+    foreach ($ev in @($env:STM32CUBEIDE_PATH, $env:STM32CUBEIDE_ROOT, $env:STM32CUBEPROG_PATH)) {
+        if ($ev) { $roots += $ev }
     }
-    # Lay ban moi nhat theo ten (vd STM32CubeIDE_2.1.1)
-    $candidates | Sort-Object Name -Descending | Select-Object -First 1 -ExpandProperty FullName
+    # Moi o dia co dinh (C:, D:, ...), khong gia dinh chi co C:
+    $drives = [System.IO.DriveInfo]::GetDrives() |
+              Where-Object { $_.IsReady -and $_.DriveType -eq 'Fixed' } |
+              ForEach-Object { $_.Name.TrimEnd('\') }
+    foreach ($d in $drives) { $roots += "$d\ST"; $roots += "$d\STMicroelectronics" }
+    # Program Files (ca 64/32-bit) va ban cai theo user — chi nhanh con STMicroelectronics
+    foreach ($pf in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+        if ($pf) { $roots += (Join-Path $pf 'STMicroelectronics') }
+    }
+    if ($env:LOCALAPPDATA) { $roots += (Join-Path $env:LOCALAPPDATA 'Programs') }
+    $roots | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
 }
 
-$cubeIde = Find-CubeIdeRoot
-if (-not $cubeIde) {
-    throw "Khong tim thay STM32CubeIDE trong C:\ST hoac Program Files. " +
-          "Cai dat hoac chinh duong dan trong build.ps1."
-}
-$plugins = Join-Path $cubeIde 'STM32CubeIDE\plugins'
-Write-Host "STM32CubeIDE : $cubeIde" -ForegroundColor Cyan
-
-# --- 2. Dinh vi gcc + make ------------------------------------------------
-function Find-Tool($pattern, $exe) {
-    $hit = Get-ChildItem $plugins -Directory -Filter $pattern -ErrorAction SilentlyContinue |
-           Sort-Object Name -Descending |
-           ForEach-Object { Join-Path $_.FullName "tools\bin\$exe" } |
-           Where-Object { Test-Path $_ } |
-           Select-Object -First 1
-    return $hit
+# Tim mot .exe: uu tien PATH, roi tim de quy trong cac thu muc goc ST;
+# lay ban moi nhat (sort giam dan theo duong dan -> version cao hon thang).
+function Find-ToolExe {
+    param([Parameter(Mandatory)][string]$Exe, [string[]]$ExtraRoots = @())
+    $onPath = Get-Command $Exe -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($onPath) { return $onPath.Source }
+    $roots = @($ExtraRoots) + (Get-StSearchRoots) | Where-Object { $_ } | Select-Object -Unique
+    foreach ($root in $roots) {
+        if (-not (Test-Path $root)) { continue }
+        $hit = Get-ChildItem $root -Recurse -Filter $Exe -File -ErrorAction SilentlyContinue |
+               Sort-Object FullName -Descending | Select-Object -First 1
+        if ($hit) { return $hit.FullName }
+    }
+    return $null
 }
 
-$gccExe  = Find-Tool 'com.st.stm32cube.ide.mcu.externaltools.gnu-tools-for-stm32*' 'arm-none-eabi-gcc.exe'
-$makeExe = Find-Tool 'com.st.stm32cube.ide.mcu.externaltools.make*'                'make.exe'
+# --- 2. gcc + make --------------------------------------------------------
+$gccExe  = Find-ToolExe -Exe 'arm-none-eabi-gcc.exe'
+$makeExe = Find-ToolExe -Exe 'make.exe'
 
-if (-not $gccExe)  { throw "Khong tim thay arm-none-eabi-gcc.exe trong plugins CubeIDE." }
-if (-not $makeExe) { throw "Khong tim thay make.exe trong plugins CubeIDE." }
+if (-not $gccExe) {
+    throw "Khong tim thay arm-none-eabi-gcc.exe. Cai STM32CubeIDE, hoac them toolchain " +
+          "arm-none-eabi vao PATH, hoac dat bien STM32CUBEIDE_PATH tro toi thu muc cai dat."
+}
+if (-not $makeExe) {
+    throw "Khong tim thay make.exe. Cai STM32CubeIDE hoac them 'make' vao PATH."
+}
 
 $gccBin  = Split-Path $gccExe
 $makeBin = Split-Path $makeExe
 $env:PATH = "$gccBin;$makeBin;$env:PATH"
 
-Write-Host "GCC          : $gccExe" -ForegroundColor Cyan
+Write-Host "GCC          : $gccExe"  -ForegroundColor Cyan
 Write-Host "make         : $makeExe" -ForegroundColor Cyan
 
 # --- 3. Tham so make ------------------------------------------------------
@@ -109,8 +128,13 @@ switch ($Task) {
             Write-Host "Chua co .hex — build truoc..." -ForegroundColor Yellow
             Invoke-Make @("-j$Jobs", $debugFlag, $gccPathArg, 'all')
         }
-        $prog = Find-Tool 'com.st.stm32cube.ide.mcu.externaltools.cubeprogrammer*' 'STM32_Programmer_CLI.exe'
-        if (-not $prog) { throw "Khong tim thay STM32_Programmer_CLI.exe." }
+        # STM32_Programmer_CLI co the nam trong CubeIDE hoac ban STM32CubeProgrammer
+        # cai rieng (thu muc STMicroelectronics) — Find-ToolExe quet ca hai + PATH.
+        $prog = Find-ToolExe -Exe 'STM32_Programmer_CLI.exe'
+        if (-not $prog) {
+            throw "Khong tim thay STM32_Programmer_CLI.exe. Cai STM32CubeProgrammer/STM32CubeIDE " +
+                  "hoac dat bien STM32CUBEPROG_PATH."
+        }
         Write-Host "Programmer   : $prog" -ForegroundColor Cyan
         & $prog -c port=SWD -w $hex -rst
         if ($LASTEXITCODE -ne 0) { throw "Flash that bai (exit $LASTEXITCODE)" }
