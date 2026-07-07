@@ -1100,22 +1100,25 @@ static void Deinterleave_Pair(uint32_t off, uint8_t pair)
   uint8_t r = (uint8_t)(pair * 2U + 1U);
   uint8_t ld = MIC_REMAP[l];                   /* destination = clean Mic slot */
   uint8_t rd = MIC_REMAP[r];
-  /* Polarity inversion is a property of the PHYSICAL capture channel: mics on
-   * ch3 (SAI1-B slot 1) and ch6 (SAI2-B slot 0) are wired inverted; negate to
-   * restore phase alignment (needed for GCC-PHAT). Keyed on capture ch, not slot. */
-  /* Per-capture-channel polarity. ch3, ch6 are wired inverted; ch5 (Mic6) is added
-   * so pair2's TDOA sign matches the table - measured with a source at a known 270deg
-   * the pair2 lag came out sign-flipped (+3 vs expected -3.7). */
-  const int32_t l_sign = (l == 6U) ? -1 : 1;
-  const int32_t r_sign = (r == 3U || r == 5U) ? -1 : 1;
-  /* pair0 (ch0=Mic1, ch1=Mic2, SAI1) uses a different, higher-output mic type that
-   * exceeds the 16-bit slot and wraps at +-32768 (verified: ~1800 wraps/frame, std
-   * ~11). Those two SAI1 channels carry a correctly sign-extended 24-bit sample
-   * (high byte 0xFF for negatives), so read them as full signed 24-bit - no wrap,
-   * coherence restored. The other channels fit in 16 bits (and SAI2 has a broken
-   * bit23), so they keep the 16-bit path. GCC-PHAT normalises amplitude, so the
-   * larger numeric range of pair0 does not need rescaling. */
-  uint8_t wide = (pair == 0U);
+  /* MIC HARDWARE CHANGE: all 8 mics are now the same type and same electrical
+   * polarity, so NO per-channel phase inversion is needed - every pair behaves like
+   * pair0 (the old clean reference). Verified from a RAW1 capture: with the old flips
+   * the pair1/2/3 mics read ANTI-PHASE (corr ~-0.65); removing the flips lines all 4
+   * opposite pairs up IN-PHASE like pair0 (corr ~+0.7), which is what GCC-PHAT needs.
+   *   old (mixed mics): l_sign = (l==6U)?-1:1;  r_sign = (r==3U||r==5U)?-1:1;
+   * Kept as named constants so a single channel can be re-inverted if ever rewired. */
+  const int32_t l_sign = 1;
+  const int32_t r_sign = 1;
+  /* MIC HARDWARE CHANGE: all 8 mics are now the higher-output type that previously
+   * sat only on pair0 (SAI1 Mic1/Mic2). This type exceeds the 16-bit slot and wraps
+   * at +-32768, but each channel carries a correctly sign-extended 24-bit sample
+   * (high byte 0xFF for negatives), so EVERY channel must be read as full signed
+   * 24-bit - the old 16-bit path clipped the new mics. GCC-PHAT normalises amplitude,
+   * so the larger numeric range needs no rescaling.
+   *   was: uint8_t wide = (pair == 0U);   // only pair0 read wide (old mixed mics)
+   * If any channel ever reverts to a 16-bit-fitting mic, gate 'wide' on its pair
+   * again and route it through the int16 branch below. */
+  uint8_t wide = 1U;
   for (uint32_t i = 0U; i < AUDIO_BLOCK_SAMPLES; i++)
   {
     int32_t rl, rr;
@@ -1473,11 +1476,12 @@ static const float g_doa_table[DOA_N_AZ][DOA_NPAIRS] = {
   */
 void DOA_Compute(const float *lag_f, float *az_deg, float *resid)
 {
-  /* EXCLUDE pair0 (Mic1-Mic2): they are a different, much more sensitive mic type
-   * that mismatches the other six, so match on the 3 remaining pairs only. The 24-bit
-   * read for pair0 is kept in Deinterleave_Pair for when a matched pair is fitted -
-   * then set DOA_SKIP_PAIR >= DOA_NPAIRS to bring pair0 back in. */
-#define DOA_SKIP_PAIR 0U
+  /* All 8 mics are now the same type (see MIC HARDWARE CHANGE in Deinterleave_Pair),
+   * so pair0 (Mic1-Mic2) is consistent with the other three and is INCLUDED again:
+   * match on all 4 opposite-pair baselines phi_k = {0,45,90,135} deg. Setting
+   * DOA_SKIP_PAIR = DOA_NPAIRS disables skipping (k never equals it); set it back to
+   * 0 to drop pair0 if that mic pair ever regresses. */
+#define DOA_SKIP_PAIR DOA_NPAIRS
   uint32_t best_a = 0U;
   float    best_e = 1e30f;
   uint32_t npairs_used = 0U;
@@ -1494,11 +1498,12 @@ void DOA_Compute(const float *lag_f, float *az_deg, float *resid)
     }
     if (e < best_e) { best_e = e; best_a = a; }
   }
-  /* Front/back correction: measured az came out a consistent 180deg off the true
-   * source (true 90 -> 270, true 270 -> 90), i.e. a global TDOA-sign convention flip.
-   * Rotate the discrete result by 180deg to match the physical bearing. */
-  uint32_t best_flipped = (best_a + (DOA_N_AZ / 2U)) % DOA_N_AZ;
-  *az_deg = g_doa_angles[best_flipped];
+  /* No front/back 180deg correction any more: that flip existed to cancel a global
+   * TDOA-sign error caused by the per-channel phase inversions, which are now removed
+   * (all mics are the same polarity - see Deinterleave_Pair). With every opposite
+   * pair in-phase, the table match gives the physical bearing directly.
+   *   was: *az_deg = g_doa_angles[(best_a + DOA_N_AZ/2) % DOA_N_AZ];  // +180deg */
+  *az_deg = g_doa_angles[best_a];
 
   /* Normalised residual: divide by (pairs_used × max_lag²); max_lag = Fs·2R/C. */
   float max_lag = ((float)AUDIO_FS_HZ * 2.0f * MIC_ARRAY_RADIUS_M) / C_SOUND_MPS;

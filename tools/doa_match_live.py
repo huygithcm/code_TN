@@ -89,10 +89,10 @@ def main():
             win.append(lags)
             if len(win)<16: continue
             med=np.median(np.array(win),axis=0); win=[]
-            # residual moi huong - LOAI pair0 (Mic1/Mic2), dung pair1,2,3 (khop firmware)
+            # residual moi huong - dung ca 4 cap (mic dong nhat, khop firmware moi)
             d2=(TABLE-med)**2
-            resid=d2[:,1:].sum(1)                    # bo pair0
-            best=(int(np.argmin(resid))+8)%16        # +180 deg front/back correction
+            resid=d2.sum(1)
+            best=int(np.argmin(resid))
 
             # ve bang
             lines=[]
