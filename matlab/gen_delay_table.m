@@ -17,14 +17,14 @@
 
 function gen_delay_table(R, N_AZ)
 
-    if nargin < 1 || isempty(R),    R    = 0.040;  end   % bán kính UCA (m) -> 80mm
+    if nargin < 1 || isempty(R),    R    = 0.04;  end   % bán kính UCA (m) -> 80mm
     if nargin < 2 || isempty(N_AZ), N_AZ = 16;     end   % số hướng (16 -> 22.5 deg)
 
     Fs = 16000;       % tần số lấy mẫu (Hz)
     C  = 343.0;       % vận tốc âm (m/s)
     N_PAIRS = 4;      % 4 cặp đối diện
 
-    az_step = 360 / N_AZ;
+    az_step = 360 / N_AZ; % tính chia ra độ phân giải của từng góc
     angles  = (0:N_AZ-1) * az_step;          % hướng ứng viên (deg)
     phi     = (0:N_PAIRS-1) * 45;            % góc baseline từng cặp (deg)
     scale   = (Fs / C) * 2 * R;              % (Fs/C)*2R, trễ cực đại (mẫu)
