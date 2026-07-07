@@ -1,19 +1,20 @@
 USB CDC raw stream check
-Generated: 2026-06-01 02:56:21
+Generated: 2026-06-11 22:47:05
 
 TASK-06 USB CDC Raw Stream Check
-Using OTG CDC port: COM12
+Auto-detected OTG CDC port: COM12
 Expecting frames: magic=RAW1 nch=8 nsamp=1024 fmt=0 (32780 bytes each)
-Need 4 valid frame(s) within 20 s.
+Need 5 valid frame(s) within 20 s.
 
-Captured 266272 bytes from COM12
+Captured 298924 bytes from COM12
 
-frame 1: seq=1  ch0[-8310..13028] ch1[-7099..9583] ch2[-8369..15494] ch3[-7524..10915] ch4[-5876..9354] ch5[-6890..11866] ch6[-9315..10891] ch7[-6091..3760]
-frame 2: seq=2  ch0[-10338..6440] ch1[-7795..6813] ch2[-10825..6666] ch3[-8317..7179] ch4[-7893..7442] ch5[-7551..8179] ch6[-5346..8039] ch7[-9006..6534]
-frame 3: seq=3  ch0[-7556..6190] ch1[-6947..6415] ch2[-8124..8549] ch3[-7006..7856] ch4[-4999..6152] ch5[-7433..7225] ch6[-4528..7340] ch7[-10244..7963]
-frame 4: seq=4  ch0[-4202..7182] ch1[-5761..5860] ch2[-5912..6854] ch3[-6276..6281] ch4[-5504..5179] ch5[-6504..6523] ch6[-5730..5559] ch7[-6158..4446]
+frame 1: seq=1  ch0[-32719..32616] ch1[-18944..22890] ch2[-32409..32673] ch3[-19853..25992] ch4[-32724..32378] ch5[-21223..25049] ch6[-17593..19053] ch7[-24251..29747]
+frame 2: seq=2  ch0[-19666..21754] ch1[-25822..22097] ch2[-32764..32617] ch3[-15656..16207] ch4[-23267..24148] ch5[-18719..21823] ch6[-14010..14493] ch7[-27554..28824]
+frame 3: seq=3  ch0[-32619..32762] ch1[-31769..32687] ch2[-22661..13690] ch3[-19025..13678] ch4[-31830..30773] ch5[-20047..22114] ch6[-14568..13144] ch7[-24217..23462]
+frame 4: seq=4  ch0[-32672..32660] ch1[-28763..25232] ch2[-32739..32552] ch3[-10499..20287] ch4[-16195..27623] ch5[-13895..23172] ch6[-16859..15447] ch7[-15232..29029]
+frame 5: seq=5  ch0[-32615..32762] ch1[-26791..26323] ch2[-16845..17488] ch3[-31966..32077] ch4[-20610..20388] ch5[-15657..15898] ch6[-10829..19658] ch7[-27020..17962]
 
-[ OK ] Received 4 valid RAW1 frame(s)
+[ OK ] Received 5 valid RAW1 frame(s)
 [ OK ] Headers valid (nch=8 nsamp=1024 fmt=0)
 [ OK ] Sequence counter advanced
 [ OK ] All samples within 24-bit range

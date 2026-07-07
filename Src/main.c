@@ -4,7 +4,7 @@
   * @file           : main.c
   * @brief          : Main program body
   * @author VŨ ĐÔNG TRIỀU
-  *
+  * @date   7/6/2026  
   * 
   ******************************************************************************
   * @attention
@@ -68,23 +68,31 @@
 #define FFT_SELFTEST_HZ      1000.0f                      /* self-test tone -> bin 64   */
 #define PI_F                 3.14159265358979f
 
-/* TASK-08: GCC-PHAT time-delay estimation between mic pairs. */
+/* TASK-08: GCC-PHAT time-delay estimation between OPPOSITE mic pairs.
+ * Each SAI pair wires two diametrically opposed mics, so the 4 baselines are
+ * full-diameter (max aperture) and span 0/45/90/135 deg. After MIC_REMAP puts
+ * mic_data in clean label order (Mic1..Mic8), the pairs read cleanly:
+ *   pair0: slot0=Mic1(0deg)   vs slot1=Mic2(180deg)  baseline phi_0 = 0 deg
+ *   pair1: slot2=Mic3(45deg)  vs slot3=Mic4(225deg)  baseline phi_1 = 45 deg
+ *   pair2: slot4=Mic5(90deg)  vs slot5=Mic6(270deg)  baseline phi_2 = 90 deg
+ *   pair3: slot6=Mic7(135deg) vs slot7=Mic8(315deg)  baseline phi_3 = 135 deg
+ * (Hardware capture order differs; the remap absorbs it - see Deinterleave_Pair.) */
 #define GCC_ENABLE           1
 #define GCC_SELFTEST_SHIFT   5                            /* synthetic delay -> lag 5   */
-#define GCC_NPAIRS_LIVE      (NUM_MIC_CHANNELS - 1U)      /* live demo: mic0 vs mic1..7 */
+#define GCC_NPAIRS_LIVE      (NUM_MIC_CHANNELS / 2U)      /* 4 opposite-mic pairs       */
 
-/* TASK-11: direction of arrival from the live mic0-vs-mic1..7 TDOAs. Planar (2D)
- * array, far-field plane-wave least-squares -> azimuth (+ elevation magnitude).
- * EDIT mic_pos[][] (near DOA_Init) to match the physical array. Current layout:
- * a 2x4 grid of the 4 stereo pairs - each pair is a column of 2 mics
- * MIC_INPAIR_SPACING_M apart (y); the 4 columns are MIC_PAIR_SPACING_M apart (x).
- * Channel index = pair*2 + side, side 0 = L, side 1 = R (matches the SAI mapping). */
+/* TASK-11: direction of arrival from the 4 opposite-pair TDOAs, matched against
+ * a hardcoded delay table. The source is assumed to lie at one of 16 fixed
+ * directions (every 22.5 deg); we pick the table row whose expected lags best
+ * match the measured ones (minimum sum-of-squared error).
+ * Azimuth 0 deg = +x (ch0 direction), positive CCW. */
 #define DOA_ENABLE           1
 #define C_SOUND_MPS          343.0f                       /* speed of sound @ 20 C      */
-#define MIC_PAIR_SPACING_M   0.01937f                     /* 19.37 mm between pairs (x) */
-#define MIC_INPAIR_SPACING_M 0.02710f                     /* 27.1 mm within a pair (y)  */
-#define DOA_NPAIRS           GCC_NPAIRS_LIVE              /* 7 baselines: mic0 vs 1..7  */
-#define DOA_SELFTEST_AZ      30.0f                        /* synthetic source azimuth   */
+#define MIC_ARRAY_RADIUS_M   0.040f                       /* UCA radius = 40 mm         */
+#define DOA_NPAIRS           GCC_NPAIRS_LIVE              /* 4 opposite-pair baselines  */
+#define DOA_N_AZ             16U                          /* candidate directions (16x22.5°) */
+#define DOA_AZ_STEP          22.5f                        /* angular resolution (deg)   */
+#define DOA_SELFTEST_AZ      45.0f                        /* synthetic source azimuth (one of the 16 table dirs) */
 
 /* TASK-09: FreeRTOS task notification flags (FFT_Task waits on these). */
 #define FLAG_FFT             (1UL << 0)                   /* a fresh half is ready      */
@@ -95,7 +103,9 @@
 typedef struct
 {
   uint32_t seq;                       /* processed-block counter                  */
-  float    lag[GCC_NPAIRS_LIVE];      /* mic0 vs mic1..7, fractional samples (TASK-11) */
+  float    lag[GCC_NPAIRS_LIVE];      /* 4 opposite-pair TDOAs, fractional samples */
+  float    level;                     /* ch0 frame RMS² (for the clap input gate) */
+  uint8_t  clipped;                   /* 1 = a mic saturated this frame (diagnostic) */
 } tdoa_result_t;
 /* USER CODE END PD */
 
@@ -227,16 +237,38 @@ float   gcc_r[FFT_SIZE];
 __attribute__((section(".DTCMSection"), aligned(32), used))
 float   gcc_corr[FFT_SIZE];
 
-volatile int32_t  g_tdoa_lag[GCC_NPAIRS_LIVE];  /* mic0 vs mic(k+1), samples (rounded) */
+volatile int32_t  g_tdoa_lag[GCC_NPAIRS_LIVE];  /* opposite-pair lags, samples (rounded) */
 float    g_tdoa_lag_f[GCC_NPAIRS_LIVE];          /* TASK-11: fractional lags (sub-sample) */
 volatile uint32_t g_gcc_us;                     /* time to compute the live pairs (us) */
 
 #if DOA_ENABLE
-/* TASK-11 DOA state. g_doa_M = precomputed least-squares pseudo-inverse rows so each
- * frame is just 2x7 MACs; g_doa_az/el = last estimate (degrees). */
-float    g_doa_M[2][DOA_NPAIRS];
+/* TASK-11 DOA state. The delay table is hardcoded (see g_doa_table below).
+ * g_doa_err = normalised residual of the last fix (0 = perfect match). */
 volatile float g_doa_az;                         /* azimuth, degrees [0,360)   */
-volatile float g_doa_el;                         /* elevation magnitude, [0,90]*/
+volatile float g_doa_el;                         /* unused (planar), kept 0    */
+volatile float g_doa_err;                        /* normalised min residual    */
+
+/* Runtime-tunable clap gate. Settable from the PC over USB CDC with lines like
+ * "SET ratio 3.0" / "SET abs 0.15" / "SET resid 0.7" (parsed in usbd_cdc_if.c).
+ * Defaults are the relaxed/easy-to-trigger values. g_cfg_dirty is raised by the
+ * CDC parser so DOA_Task echoes the new config to the VCP log. */
+volatile float   g_clap_ratio    = 1.8f;         /* clap if level > ratio*floor */
+volatile float   g_clap_abs      = 0.0001f;      /* absolute level floor (sum over a
+                                                  * frame of normalised ch0 energy).
+                                                  * Retuned for the uniform 24-bit mic
+                                                  * front-end: live "alo" peaks at
+                                                  * maxLev_u ~2k-28k (level ~2e-3..3e-2),
+                                                  * silence ~250 (~2.5e-4). 1e-4 catches
+                                                  * speech and the residual gate rejects
+                                                  * incoherent noise. Was 3e-6 (tuned for
+                                                  * the old 16-bit path, ~65000x smaller
+                                                  * level) - far too low here. */
+volatile float   g_doa_resid_max = 0.7f;         /* reject fits worse than this */
+volatile uint8_t g_cfg_dirty     = 0U;           /* CDC parser -> DOA_Task echo */
+/* Voice-tracking mode: 0 = clap gate (impulsive onset only); 1 = continuous voice
+ * activity - any frame whose band-limited energy is above g_clap_abs is voted on,
+ * so the camera follows a person talking (not just hand claps). */
+volatile uint8_t g_voice_mode    = 1U;
 #endif
 #endif
 #endif
@@ -254,6 +286,36 @@ volatile uint8_t g_usb_snapshot_valid;
 volatile uint32_t g_blocks;                     /* processed-block counter (Monitor)  */
 volatile uint32_t g_sai_errors;                 /* TASK-12: HW SAI errors (HAL_SAI_ErrorCallback) */
 volatile uint32_t g_sai_err_code;               /* TASK-12: last HAL SAI error code    */
+
+/* =========================================================================
+ * DIRECTION STANDARD  (single source of truth - mirror in tools/plot_doa.py)
+ * -------------------------------------------------------------------------
+ * Azimuth `az` in [0,360):  0 deg = mic 1 (ch0) direction, increasing CCW.
+ * Mic <-> az (board mics numbered CW 1,7,5,3,2,8,6,4; mic n = ch n-1):
+ *     mic1=0  mic4=45  mic6=90  mic8=135  mic2=180  mic3=225  mic5=270  mic7=315
+ * Servo in [0,180]:   servo = clamp(90 + SERVO_DIR * wrap(az - SERVO_AZ_CENTER))
+ *     SERVO_AZ_CENTER = 0   -> mic 1 (az 0) is the camera FRONT = servo 90 (neutral)
+ *     SERVO_DIR       = -1  -> mic 6 (az 90) = servo 0 ,  mic 5 (az 270) = servo 180
+ * The 180 deg servo only covers the FRONT half-circle; rear sources (az ~180)
+ * clamp to the nearest edge. tools/plot_doa.py MUST use the same two constants.
+ * ========================================================================= */
+
+/* Camera-pan servo on PB6 (TIM4_CH1 PWM, 50 Hz frame: 1 us/tick, 20 ms period). */
+TIM_HandleTypeDef htim4;
+#define SERVO_TIM_PSC     (64U - 1U)     /* 64 MHz / 64  = 1 MHz -> 1 us/tick */
+#define SERVO_TIM_ARR     (20000U - 1U)  /* 20000 us     = 20 ms -> 50 Hz     */
+/* SG90 (180 deg): pulse 600..2400 us, symmetric about 1500 us (neutral = 90 deg).
+ * Avoids 500/2500 which over-travels the SG90 end-stops (buzz/stall at extremes). */
+#define SERVO_MIN_US      600.0f         /* pulse at servo 0 deg              */
+#define SERVO_MAX_US      2400.0f        /* pulse at servo 180 deg            */
+/* Measured on the real rig: servo 0->Mic6(az270), 90->Mic2(az180), 180->Mic5(az90).
+ * => camera neutral (servo 90) faces az 180 (Mic2); servo = 90 - wrap(az-180). */
+#define SERVO_AZ_CENTER   180.0f         /* azimuth that maps to servo 90 deg  */
+#define SERVO_DIR         (-1.0f)        /* pan sense (see DIRECTION STANDARD)  */
+volatile float   g_servo_deg;           /* last commanded servo angle (debug) */
+/* 1 = DOA drives the servo (auto-track sound); 0 = manual only. A manual "SERVO
+ * <deg>" command clears this so testing isn't fought by DOA; "AUTO 1" restores. */
+volatile uint8_t g_servo_auto = 1U;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -286,17 +348,125 @@ int32_t GCC_PHAT(const float *a, const float *b);
 void GCC_SelfTest(void);
 void GCC_ProcessPairs(void);
 #if DOA_ENABLE
-void DOA_Init(void);
-void DOA_Compute(const float *lag_f, float *az_deg, float *el_deg);
+void DOA_Compute(const float *lag_f, float *az_deg, float *resid);
 void DOA_SelfTest(void);
 #endif
 #endif
 #endif
 void Pipeline_InitOnce(void);
+/* Servo (camera pan) on PB6 = TIM4_CH1 PWM, 50 Hz. */
+static void MX_TIM4_Init(void);
+void Servo_SetAngle(float deg);           /* raw servo angle [0,180]; 90 = front  */
+void Servo_MoveTo(float deg);             /* gradual move with per-step delay     */
+void Servo_PointToAzimuth(float az_deg);  /* map DOA azimuth -> servo angle       */
+void Servo_Release(void);                 /* stop PWM pulses (silence holding buzz) */
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+/* Bring up TIM4_CH1 as a 50 Hz PWM on PB6 to drive the camera-pan servo.
+ * Self-contained (no CubeMX MspInit): enables GPIOB+TIM4 clocks and sets PB6 to
+ * AF2 (TIM4_CH1). 1 us tick, 20 ms frame; duty is set later in micro-seconds. */
+static void MX_TIM4_Init(void)
+{
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_TIM4_CLK_ENABLE();
+
+  GPIO_InitTypeDef gpio = {0};
+  gpio.Pin       = GPIO_PIN_6;
+  gpio.Mode      = GPIO_MODE_AF_PP;
+  gpio.Pull      = GPIO_NOPULL;
+  gpio.Speed     = GPIO_SPEED_FREQ_LOW;
+  gpio.Alternate = GPIO_AF2_TIM4;
+  HAL_GPIO_Init(GPIOB, &gpio);
+
+  htim4.Instance           = TIM4;
+  htim4.Init.Prescaler     = SERVO_TIM_PSC;
+  htim4.Init.CounterMode   = TIM_COUNTERMODE_UP;
+  htim4.Init.Period        = SERVO_TIM_ARR;
+  htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  if (HAL_TIM_PWM_Init(&htim4) != HAL_OK) { Error_Handler(); }
+
+  TIM_OC_InitTypeDef oc = {0};
+  oc.OCMode     = TIM_OCMODE_PWM1;
+  oc.Pulse      = 1500U;                 /* ~centre until first command */
+  oc.OCPolarity = TIM_OCPOLARITY_HIGH;
+  oc.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim4, &oc, TIM_CHANNEL_1) != HAL_OK) { Error_Handler(); }
+
+  HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1);
+}
+
+/* Command the servo to an absolute angle in [0,180] deg (90 = front = mic 1). */
+void Servo_SetAngle(float deg)
+{
+  if (deg < 0.0f)   { deg = 0.0f; }
+  if (deg > 180.0f) { deg = 180.0f; }
+  float us = SERVO_MIN_US + (SERVO_MAX_US - SERVO_MIN_US) * (deg / 180.0f);
+  __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, (uint32_t)lroundf(us));
+  g_servo_deg = deg;
+}
+
+/* Release the servo: stop the PWM pulses (0% duty) so the motor is not actively
+ * holding. A held servo hunts/buzzes continuously - the mic array localises that
+ * mechanical noise to the servo's fixed direction and the DOA gets biased toward it
+ * (e.g. always drifting to 90 deg where the servo sits). With no pulse the servo
+ * goes quiet; a light camera stays put by gear friction. The next Servo_SetAngle
+ * restores the pulse and position. */
+void Servo_Release(void)
+{
+  __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, 0U);
+}
+
+/* Move to an angle GRADUALLY: step a few degrees at a time with a short delay so
+ * the servo has time to travel (and the current draw is gentler -> less brown-out).
+ * Blocking via HAL_Delay - fine both before the RTOS (boot) and inside a task. */
+#define SERVO_STEP_DEG   2.0f      /* small step -> smooth, quiet travel       */
+#define SERVO_STEP_MS    14U       /* delay per step (~ servo travel speed)   */
+#define SERVO_DEADBAND_DEG 4.0f    /* ignore moves smaller than this (anti-jitter) */
+void Servo_MoveTo(float deg)
+{
+  if (deg < 0.0f)   { deg = 0.0f; }
+  if (deg > 180.0f) { deg = 180.0f; }
+  float cur  = g_servo_deg;
+  /* Dead-band: don't twitch for tiny target changes - each move makes mechanical
+   * noise the mics hear, so micro-moves would needlessly re-arm the feedback path. */
+  if (fabsf(deg - cur) < SERVO_DEADBAND_DEG) { return; }
+  float step = (deg >= cur) ? SERVO_STEP_DEG : -SERVO_STEP_DEG;
+  while (fabsf(deg - cur) > SERVO_STEP_DEG)
+  {
+    cur += step;
+    Servo_SetAngle(cur);
+    HAL_Delay(SERVO_STEP_MS);
+  }
+  Servo_SetAngle(deg);             /* land exactly on target */
+  HAL_Delay(SERVO_STEP_MS);
+  Servo_Release();                 /* stop pulses -> no holding buzz for the mics */
+}
+
+/* Point the camera at a DOA azimuth (firmware convention, 0 deg = mic 0/ch0).
+ * The camera looks straight ahead (servo 90 deg) at SERVO_AZ_CENTER and pans left/
+ * right with SERVO_DIR. The servo only spans 180 deg, so sources in the rear
+ * hemisphere clamp to the nearest reachable edge (handled by Servo_SetAngle).
+ *   r  = signed bearing off centre, in (-180,180]
+ *   servo = 90 + SERVO_DIR * r   (e.g. az 0 -> 90, az 90 -> 0, az 270 -> 180) */
+/* Low-pass (EMA) on the SERVO angle: the DOA estimate jumps between adjacent
+ * directions frame to frame, so command only a fraction of the way to the new
+ * target each update. The camera then eases toward the source instead of snapping,
+ * which cuts both the visual jitter and the mechanical noise the mics pick up.
+ * Lower = smoother/quieter but slower to settle. */
+#define SERVO_SMOOTH 0.4f
+void Servo_PointToAzimuth(float az_deg)
+{
+  float r = fmodf(az_deg - SERVO_AZ_CENTER, 360.0f);
+  if (r < -180.0f) { r += 360.0f; }
+  if (r >  180.0f) { r -= 360.0f; }
+  float target = 90.0f + SERVO_DIR * r;              /* raw servo angle for this DOA */
+  float smooth = g_servo_deg + SERVO_SMOOTH * (target - g_servo_deg);  /* EMA filter */
+  Servo_MoveTo(smooth);                              /* small-step gradual travel    */
+}
 
 /* USER CODE END 0 */
 
@@ -344,7 +514,24 @@ int main(void)
   MX_SAI1_Init();
   MX_SAI2_Init();
   /* USER CODE BEGIN 2 */
-
+  MX_TIM4_Init();              /* camera-pan servo PWM on PB6 */
+  /* Boot self-test: sweep the camera across its full reachable range so the
+   * physical orientation can be verified. Uses the SAME az->servo mapping as DOA
+   * (Servo_PointToAzimuth). Runs before the RTOS, so HAL_Delay (SysTick) is valid.
+   * Measured mapping (SERVO_AZ_CENTER=180):
+   *   Mic6 -> az 270 -> servo   0
+   *   Mic2 -> az 180 -> servo  90 (chinh dien camera)
+   *   Mic5 -> az  90 -> servo 180 */
+  static const float k_mic_az[3] = { 270.0f, 180.0f, 90.0f };  /* Mic6, Mic2, Mic5 */
+  for (uint32_t r = 0U; r < 2U; r++)                          /* 2 vong */
+  {
+    for (uint32_t i = 0U; i < 3U; i++)
+    {
+      Servo_PointToAzimuth(k_mic_az[i]);
+      HAL_Delay(1000);
+    }
+  }
+  Servo_SetAngle(90.0f);  HAL_Delay(500);   /* park at centre (mic 1) */
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -886,22 +1073,76 @@ void HAL_SAI_RxCpltCallback(SAI_HandleTypeDef *hsai)
   if (p == 0U) { Audio_NotifyHalfReady(1U); }   /* master block, PONG */
 }
 
+/* TASK-11: channel remap (capture order -> clean logical mic order).
+ * The board is wired so the captured SAI channels land out of order vs the
+ * physical mic labels in the docs (Mic1..Mic8 at 0/180/45/225/90/270/135/315 deg).
+ * Rather than baking that scramble into g_doa_table, we fix it ONCE here at copy
+ * time so the rest of the pipeline sees clean pairs and the table uses the natural
+ * baselines phi_k = {0,45,90,135}. MIC_REMAP[capture_ch] = logical mic slot.
+ * Calibrated by tapping each physical mic and reading tools/test_mic_order.py.
+ * Measured board wiring (physical angle -> capture channel):
+ *   0=ch0  45=ch6  90=ch4  135=ch2  180=ch1  225=ch7  270=ch5  315=ch3.
+ * Each capture ch routed to the slot whose pair-angle matches:
+ *   ch0->0  ch1->1  ch2->6  ch3->7  ch4->4  ch5->5  ch6->2  ch7->3
+ * (Re-run the test if the board is re-wired; only this array needs editing.) */
+static const uint8_t MIC_REMAP[NUM_MIC_CHANNELS] = { 0U, 1U, 7U, 6U, 5U, 4U, 2U, 3U };
+
+/* No per-mic gain normalisation: under a real signal all 8 mics measure within
+ * ~1.5x of each other, so their true sensitivities are essentially equal. The
+ * earlier ambient-RMS calibration was invalid - quiet-room RMS is dominated by
+ * each mic's own noise floor, not a uniform sound field, so it over-attenuated
+ * one channel. GCC-PHAT whitens magnitude anyway, so DOA barely depends on gain. */
+
 /* Deinterleave one stereo pair's half-buffer into the two per-mic arrays.
  * SAI 24-bit data is MSB-left-justified in a 32-bit slot, so the signed 24-bit
  * sample is (word >> 8); /2^23 normalizes to [-1,1]. */
 static void Deinterleave_Pair(uint32_t off, uint8_t pair)
 {
   const int32_t *src = &dma_buf[pair][off];
-  uint8_t l = (uint8_t)(pair * 2U);
+  uint8_t l = (uint8_t)(pair * 2U);            /* capture channels (DMA order) */
   uint8_t r = (uint8_t)(pair * 2U + 1U);
+  uint8_t ld = MIC_REMAP[l];                   /* destination = clean Mic slot */
+  uint8_t rd = MIC_REMAP[r];
+  /* MIC HARDWARE CHANGE: all 8 mics are now the same type and same electrical
+   * polarity, so NO per-channel phase inversion is needed - every pair behaves like
+   * pair0 (the old clean reference). Verified from a RAW1 capture: with the old flips
+   * the pair1/2/3 mics read ANTI-PHASE (corr ~-0.65); removing the flips lines all 4
+   * opposite pairs up IN-PHASE like pair0 (corr ~+0.7), which is what GCC-PHAT needs.
+   *   old (mixed mics): l_sign = (l==6U)?-1:1;  r_sign = (r==3U||r==5U)?-1:1;
+   * Kept as named constants so a single channel can be re-inverted if ever rewired. */
+  const int32_t l_sign = 1;
+  const int32_t r_sign = 1;
+  /* MIC HARDWARE CHANGE: all 8 mics are now the higher-output type that previously
+   * sat only on pair0 (SAI1 Mic1/Mic2). This type exceeds the 16-bit slot and wraps
+   * at +-32768, but each channel carries a correctly sign-extended 24-bit sample
+   * (high byte 0xFF for negatives), so EVERY channel must be read as full signed
+   * 24-bit - the old 16-bit path clipped the new mics. GCC-PHAT normalises amplitude,
+   * so the larger numeric range needs no rescaling.
+   *   was: uint8_t wide = (pair == 0U);   // only pair0 read wide (old mixed mics)
+   * If any channel ever reverts to a 16-bit-fitting mic, gate 'wide' on its pair
+   * again and route it through the int16 branch below. */
+  uint8_t wide = 1U;
   for (uint32_t i = 0U; i < AUDIO_BLOCK_SAMPLES; i++)
   {
-    int32_t rl = (int16_t)(src[2U * i] & 0xFFFF);
-    int32_t rr = (int16_t)(src[2U * i + 1U] & 0xFFFF);
-    mic_raw[l][i]  = rl;
-    mic_raw[r][i]  = rr;
-    mic_data[l][i] = (float)rl * (1.0f / 8388608.0f);
-    mic_data[r][i] = (float)rr * (1.0f / 8388608.0f);
+    int32_t rl, rr;
+    if (wide)
+    {
+      int32_t sl = src[2U * i]      & 0x00FFFFFF;
+      int32_t sr = src[2U * i + 1U] & 0x00FFFFFF;
+      if (sl & 0x00800000) { sl -= 0x01000000; }
+      if (sr & 0x00800000) { sr -= 0x01000000; }
+      rl = l_sign * sl;
+      rr = r_sign * sr;
+    }
+    else
+    {
+      rl = l_sign * (int32_t)(int16_t)(src[2U * i] & 0xFFFF);
+      rr = r_sign * (int32_t)(int16_t)(src[2U * i + 1U] & 0xFFFF);
+    }
+    mic_raw[ld][i]  = rl;
+    mic_raw[rd][i]  = rr;
+    mic_data[ld][i] = (float)rl * (1.0f / 8388608.0f);
+    mic_data[rd][i] = (float)rr * (1.0f / 8388608.0f);
   }
 }
 
@@ -911,6 +1152,7 @@ static void Deinterleave_Pair(uint32_t off, uint8_t pair)
   *         (master) begins generating SCK/FS.
   * @retval None
   */
+ // khai báo DMA buffer, khởi tạo các biến đếm và trạng thái, sau đó bắt đầu nhận dữ liệu từ các khối SAI bằng DMA. Các khối slave được kích hoạt trước, khối master (SAI1_A) được kích hoạt cuối cùng.
 void Audio_Start(void)
 {
   memset((void *)dma_half_cnt, 0, sizeof(dma_half_cnt));
@@ -959,6 +1201,7 @@ static uint32_t FFT_PeakBin(const float *mag, float *peakVal)
   *         Reads mic_data[m][] (float, normalized), writes fft_mag[m][0..511].
   *         Times the whole 8-mic pass with the DWT cycle counter.
   */
+ // tính fft 1024 điểm cho tất cả 8 micro, áp dụng cửa sổ Hann, thực hiện FFT thực và tính độ lớn. Đo thời gian thực hiện bằng bộ đếm chu kỳ DWT.
 void FFT_ProcessAll(void)
 {
   uint32_t t0 = DWT->CYCCNT;
@@ -1056,13 +1299,24 @@ int32_t GCC_PHAT(const float *a, const float *b)
   memcpy(fft_win, b, sizeof(float) * FFT_SIZE);
   arm_rfft_fast_f32(&fft_inst, fft_win, gcc_b, 0U);
 
-  /* Packed format: [0] = DC (real), [1] = Nyquist (real), then (re,im) per bin.
-   * For the two real-only terms, conj(Xa).Xb is just the product; PHAT -> sign. */
-  gcc_r[0] = (gcc_a[0] * gcc_b[0] >= 0.0f) ? 1.0f : -1.0f;
-  gcc_r[1] = (gcc_a[1] * gcc_b[1] >= 0.0f) ? 1.0f : -1.0f;
+  /* Band-limited GCC-PHAT: only keep bins in [GCC_BIN_LO, GCC_BIN_HI]. Low-frequency
+   * energy (room/mic hum, bass) gives tiny inter-mic delays whose SIGN is noise-
+   * dominated -> front/back mirror flips (az vs az+180). High bins add little for
+   * speech. Keeping ~250-3500 Hz makes the delay sign reliable and steadies the DOA.
+   * bin = freq * FFT_SIZE / Fs = freq / 15.625 Hz. */
+#define GCC_BIN_LO  16U   /* ~250 Hz  */
+#define GCC_BIN_HI  224U  /* ~3500 Hz */
+  gcc_r[0] = 0.0f;        /* zero DC + Nyquist (out of band) */
+  gcc_r[1] = 0.0f;
 
   for (uint32_t k = 1U; k < FFT_BINS; k++)
   {
+    if (k < GCC_BIN_LO || k > GCC_BIN_HI)   /* outside voice band -> drop */
+    {
+      gcc_r[2U * k]      = 0.0f;
+      gcc_r[2U * k + 1U] = 0.0f;
+      continue;
+    }
     float ar = gcc_a[2U * k], ai = gcc_a[2U * k + 1U];
     float br = gcc_b[2U * k], bi = gcc_b[2U * k + 1U];
     /* conj(Xa) * Xb = (ar - j ai)(br + j bi); peak at +D when b lags a by D
@@ -1077,24 +1331,45 @@ int32_t GCC_PHAT(const float *a, const float *b)
 
   arm_rfft_fast_f32(&fft_inst, gcc_r, gcc_corr, 1U);   /* inverse -> correlation */
 
-  float    maxVal;
-  uint32_t maxIdx;
-  arm_max_f32(gcc_corr, FFT_SIZE, &maxVal, &maxIdx);
-
-  /* TASK-11: parabolic interpolation around the peak for a sub-sample lag. The
-   * array is tiny (max delay ~2.7 samples), so integer lags are too coarse for a
-   * meaningful angle; fitting a parabola to the 3 points recovers the fraction.
-   * gcc_corr is circular (length FFT_SIZE), so neighbours wrap around. */
-  uint32_t im1 = (maxIdx == 0U) ? (FFT_SIZE - 1U) : (maxIdx - 1U);
-  uint32_t ip1 = (maxIdx + 1U == FFT_SIZE) ? 0U : (maxIdx + 1U);
-  float ym1 = gcc_corr[im1], y0 = gcc_corr[maxIdx], yp1 = gcc_corr[ip1];
-  float denom = ym1 - 2.0f * y0 + yp1;
-  float delta = (fabsf(denom) > 1e-12f) ? (0.5f * (ym1 - yp1) / denom) : 0.0f;
-  if (delta > 1.0f)  { delta = 1.0f; }
-  if (delta < -1.0f) { delta = -1.0f; }
+  /* Restrict the peak search to the PHYSICALLY POSSIBLE lag window (|lag| <= a few
+   * samples for an 8 cm array, max delay ~3.7). Searching the whole 1024-pt circular
+   * correlation let low-frequency hum (47-91 Hz from the mics / room) build a broad
+   * spurious peak at a large lag, which won and produced a bogus TDOA (resid ~1.0).
+   * Bounding the search to +-GCC_LAG_SEARCH fixes the live-vs-offline gap. */
+#define GCC_LAG_SEARCH 5
+  float    maxVal = -1e30f;
+  uint32_t maxIdx = 0U;
+  for (int32_t L = -GCC_LAG_SEARCH; L <= GCC_LAG_SEARCH; L++)
+  {
+    uint32_t idx = (uint32_t)((L < 0) ? (L + (int32_t)FFT_SIZE) : L);
+    if (gcc_corr[idx] > maxVal) { maxVal = gcc_corr[idx]; maxIdx = idx; }
+  }
 
   int32_t lag = (int32_t)maxIdx;
   if (lag > (int32_t)(FFT_SIZE / 2U)) { lag -= (int32_t)FFT_SIZE; }
+
+  /* TASK-11: SUB-SAMPLE refinement by PHASE-SLOPE. The integer peak above is coarse;
+   * for a whitened (PHAT) cross-spectrum the true delay D gives a linear phase
+   * phi_k = -2*pi*k*D/FFT_SIZE. Removing the integer part (lag) leaves a small
+   * residual phase psi_k = -2*pi*k*delta/FFT_SIZE; a least-squares slope of psi_k
+   * over ALL in-band bins recovers delta with far lower variance than a 3-point
+   * parabola (uses ~200 bins instead of 3). |delta|<0.5 keeps psi within +/-pi so no
+   * unwrapping is needed. */
+  const float w = 6.2831853f / (float)FFT_SIZE;   /* 2*pi / N */
+  float sum_kk = 0.0f, sum_kpsi = 0.0f;
+  for (uint32_t k = GCC_BIN_LO; k <= GCC_BIN_HI; k++)
+  {
+    float re = gcc_r[2U * k], im = gcc_r[2U * k + 1U];
+    float psi = atan2f(im, re) + w * (float)k * (float)lag;  /* residual phase */
+    if (psi >  3.14159265f) { psi -= 6.2831853f; }           /* guard wrap */
+    if (psi < -3.14159265f) { psi += 6.2831853f; }
+    sum_kk   += (float)k * (float)k;
+    sum_kpsi += (float)k * psi;
+  }
+  float delta = (sum_kk > 1e-6f) ? (-(sum_kpsi / sum_kk) / w) : 0.0f;
+  if (delta >  1.0f) { delta =  1.0f; }
+  if (delta < -1.0f) { delta = -1.0f; }
+
   g_last_frac = (float)lag + delta;
   return lag;
 }
@@ -1137,126 +1412,130 @@ void GCC_SelfTest(void)
 }
 
 /**
-  * @brief  TASK-08 - compute live TDOA lags for mic0 vs mic1..7 from mic_data,
-  *         timing the whole set with the DWT counter.
+  * @brief  TASK-08 - compute live TDOA lags between the 4 OPPOSITE mic pairs
+  *         (ch0-ch1, ch2-ch3, ch4-ch5, ch6-ch7) from mic_data, timing the whole
+  *         set with the DWT counter. Pair k uses channels 2k (lower angle) and
+  *         2k+1 (opposite); the lag sign matches the hardcoded DOA table.
   */
 void GCC_ProcessPairs(void)
 {
   uint32_t t0 = DWT->CYCCNT;
   for (uint32_t k = 0U; k < GCC_NPAIRS_LIVE; k++)
   {
-    g_tdoa_lag[k]   = GCC_PHAT(mic_data[0], mic_data[k + 1U]);
+    g_tdoa_lag[k]   = GCC_PHAT(mic_data[2U * k], mic_data[2U * k + 1U]);
     g_tdoa_lag_f[k] = g_last_frac;       /* TASK-11: sub-sample lag for DOA */
   }
   g_gcc_us = (DWT->CYCCNT - t0) / 64U;   /* cycles @ 64 MHz -> us */
 }
 
 #if DOA_ENABLE
-/* TASK-11: physical mic coordinates in metres, channel-major (ch = pair*2 + side).
- * >>> EDIT THIS TABLE to match the real array <<<. Default = 2x4 grid: pair p sits
- * at x = p * MIC_PAIR_SPACING_M; the pair's two mics (L = side 0, R = side 1) at
- * y = 0 and y = MIC_INPAIR_SPACING_M. The x axis is the pair (column) axis, the y
- * axis is the in-pair axis. Only differences relative to mic0 matter, so the origin
- * is arbitrary. Azimuth below is measured in this x-y plane: 0 deg = +x, 90 = +y, CCW. */
-static const float mic_pos[NUM_MIC_CHANNELS][2] = {
-  { 0.0f * MIC_PAIR_SPACING_M, 0.0f                },  /* ch0  pair0 L */
-  { 0.0f * MIC_PAIR_SPACING_M, MIC_INPAIR_SPACING_M },  /* ch1  pair0 R */
-  { 1.0f * MIC_PAIR_SPACING_M, 0.0f                },  /* ch2  pair1 L */
-  { 1.0f * MIC_PAIR_SPACING_M, MIC_INPAIR_SPACING_M },  /* ch3  pair1 R */
-  { 2.0f * MIC_PAIR_SPACING_M, 0.0f                },  /* ch4  pair2 L */
-  { 2.0f * MIC_PAIR_SPACING_M, MIC_INPAIR_SPACING_M },  /* ch5  pair2 R */
-  { 3.0f * MIC_PAIR_SPACING_M, 0.0f                },  /* ch6  pair3 L */
-  { 3.0f * MIC_PAIR_SPACING_M, MIC_INPAIR_SPACING_M },  /* ch7  pair3 R */
+/* TASK-11: physical mic geometry (UCA diameter 80mm, R = 0.040 m). Each SAI pair
+ * wires two diametrically opposed mics. With MIC_REMAP applied at deinterleave,
+ * mic_data is in CLEAN label order (Mic1..Mic8):
+ *   slot0=0  slot1=180 | slot2=45 slot3=225 | slot4=90 slot5=270 | slot6=135 slot7=315 (deg)
+ * so opposite pair k = (slot 2k, slot 2k+1) and the even slot sits at the natural
+ * baseline phi_k = {0,45,90,135} deg. The hardware miswiring is absorbed entirely
+ * by MIC_REMAP (see Deinterleave_Pair), NOT by this table. */
+
+/* Candidate azimuths (degrees, 16 directions × 22.5°). */
+static const float g_doa_angles[DOA_N_AZ] = {
+    0.0f,  22.5f,  45.0f,  67.5f,  90.0f, 112.5f, 135.0f, 157.5f,
+  180.0f, 202.5f, 225.0f, 247.5f, 270.0f, 292.5f, 315.0f, 337.5f
+};
+
+/* TASK-11: HARDCODED TDOA table. g_doa_table[a][k] = expected lag (samples) on
+ * opposite pair k for a source at azimuth g_doa_angles[a].
+ * Pair k = GCC_PHAT(slot[2k], slot[2k+1]); baseline angle phi_k = {0,45,90,135} deg
+ * (clean label order; hardware scramble handled by MIC_REMAP, not this table).
+ * Formula:  lag = (Fs/C) * 2R * cos(az - phi_k),  (Fs/C)*2R = 3.731778 samples.
+ * Regenerate if Fs, R, or the pair wiring changes. */
+static const float g_doa_table[DOA_N_AZ][DOA_NPAIRS] = {
+  {   3.731778f,   2.638766f,   0.000000f,  -2.638766f },  /* az=  0.0 */
+  {   3.447714f,   3.447714f,   1.428090f,  -1.428090f },  /* az= 22.5 */
+  {   2.638766f,   3.731778f,   2.638766f,   0.000000f },  /* az= 45.0 */
+  {   1.428090f,   3.447714f,   3.447714f,   1.428090f },  /* az= 67.5 */
+  {   0.000000f,   2.638766f,   3.731778f,   2.638766f },  /* az= 90.0 */
+  {  -1.428090f,   1.428090f,   3.447714f,   3.447714f },  /* az=112.5 */
+  {  -2.638766f,   0.000000f,   2.638766f,   3.731778f },  /* az=135.0 */
+  {  -3.447714f,  -1.428090f,   1.428090f,   3.447714f },  /* az=157.5 */
+  {  -3.731778f,  -2.638766f,   0.000000f,   2.638766f },  /* az=180.0 */
+  {  -3.447714f,  -3.447714f,  -1.428090f,   1.428090f },  /* az=202.5 */
+  {  -2.638766f,  -3.731778f,  -2.638766f,   0.000000f },  /* az=225.0 */
+  {  -1.428090f,  -3.447714f,  -3.447714f,  -1.428090f },  /* az=247.5 */
+  {   0.000000f,  -2.638766f,  -3.731778f,  -2.638766f },  /* az=270.0 */
+  {   1.428090f,  -1.428090f,  -3.447714f,  -3.447714f },  /* az=292.5 */
+  {   2.638766f,   0.000000f,  -2.638766f,  -3.731778f },  /* az=315.0 */
+  {   3.447714f,   1.428090f,  -1.428090f,  -3.447714f },  /* az=337.5 */
 };
 
 /**
-  * @brief  TASK-11 - precompute the least-squares pseudo-inverse for the DOA solve.
-  *         Far-field plane wave: each baseline d_k = pos[k+1]-pos[0] obeys
-  *         d_k . u = -(C/Fs) * lag_k, with u the unit direction to the source. With
-  *         7 baselines and 2 unknowns (planar array), u = (DtD)^-1 Dt b in the
-  *         least-squares sense. We fold the -(C/Fs) scale into M so that, per frame,
-  *         u = M . lag_f is a plain 2x7 dot product.
+  * @brief  TASK-11 - table-match DOA. The source is assumed to sit at one of the
+  *         8 fixed 45-degree directions; pick the table row whose expected lags
+  *         best match the 4 measured opposite-pair TDOAs (minimum sum-of-squared
+  *         error). Output azimuth is discrete (0/45/90/.../315).
+  *
+  *         *resid is the normalised minimum SSE: 0 = perfect match, larger =
+  *         noisier fix. Also stored in g_doa_err.
   */
-void DOA_Init(void)
+void DOA_Compute(const float *lag_f, float *az_deg, float *resid)
 {
-  float D[DOA_NPAIRS][2];
-  for (uint32_t k = 0U; k < DOA_NPAIRS; k++)
+  /* All 8 mics are now the same type (see MIC HARDWARE CHANGE in Deinterleave_Pair),
+   * so pair0 (Mic1-Mic2) is consistent with the other three and is INCLUDED again:
+   * match on all 4 opposite-pair baselines phi_k = {0,45,90,135} deg. Setting
+   * DOA_SKIP_PAIR = DOA_NPAIRS disables skipping (k never equals it); set it back to
+   * 0 to drop pair0 if that mic pair ever regresses. */
+#define DOA_SKIP_PAIR DOA_NPAIRS
+  uint32_t best_a = 0U;
+  float    best_e = 1e30f;
+  uint32_t npairs_used = 0U;
+  for (uint32_t a = 0U; a < DOA_N_AZ; a++)
   {
-    D[k][0] = mic_pos[k + 1U][0] - mic_pos[0][0];
-    D[k][1] = mic_pos[k + 1U][1] - mic_pos[0][1];
+    float e = 0.0f;
+    npairs_used = 0U;
+    for (uint32_t k = 0U; k < DOA_NPAIRS; k++)
+    {
+      if (k == DOA_SKIP_PAIR) { continue; }
+      float d = lag_f[k] - g_doa_table[a][k];
+      e += d * d;
+      npairs_used++;
+    }
+    if (e < best_e) { best_e = e; best_a = a; }
   }
-  /* DtD = [[a b],[b c]] */
-  float a = 0.0f, b = 0.0f, c = 0.0f;
-  for (uint32_t k = 0U; k < DOA_NPAIRS; k++)
-  {
-    a += D[k][0] * D[k][0];
-    b += D[k][0] * D[k][1];
-    c += D[k][1] * D[k][1];
-  }
-  float det = a * c - b * b;
-  if (fabsf(det) < 1e-18f) { det = 1e-18f; }      /* guard degenerate geometry */
-  float inv00 = c / det, inv01 = -b / det, inv11 = a / det;
-  float scale = -C_SOUND_MPS / (float)AUDIO_FS_HZ;
-  for (uint32_t k = 0U; k < DOA_NPAIRS; k++)
-  {
-    g_doa_M[0][k] = scale * (inv00 * D[k][0] + inv01 * D[k][1]);
-    g_doa_M[1][k] = scale * (inv01 * D[k][0] + inv11 * D[k][1]);
-  }
+  /* No front/back 180deg correction any more: that flip existed to cancel a global
+   * TDOA-sign error caused by the per-channel phase inversions, which are now removed
+   * (all mics are the same polarity - see Deinterleave_Pair). With every opposite
+   * pair in-phase, the table match gives the physical bearing directly.
+   *   was: *az_deg = g_doa_angles[(best_a + DOA_N_AZ/2) % DOA_N_AZ];  // +180deg */
+  *az_deg = g_doa_angles[best_a];
+
+  /* Normalised residual: divide by (pairs_used × max_lag²); max_lag = Fs·2R/C. */
+  float max_lag = ((float)AUDIO_FS_HZ * 2.0f * MIC_ARRAY_RADIUS_M) / C_SOUND_MPS;
+  float norm_e  = best_e / ((float)npairs_used * max_lag * max_lag + 1e-10f);
+  g_doa_err = norm_e;
+  *resid    = norm_e;
 }
 
 /**
-  * @brief  TASK-11 - turn the 7 fractional TDOA lags into azimuth + elevation.
-  *         u = M . lag_f gives the in-plane projection of the unit direction; its
-  *         angle is the azimuth and its magnitude is sin(zenith) = cos(elevation),
-  *         so |u|=1 -> source in the array plane, |u|=0 -> overhead. A planar array
-  *         cannot tell above from below the plane, so elevation is a magnitude.
-  */
-void DOA_Compute(const float *lag_f, float *az_deg, float *el_deg)
-{
-  float sx = 0.0f, sy = 0.0f;
-  for (uint32_t k = 0U; k < DOA_NPAIRS; k++)
-  {
-    sx += g_doa_M[0][k] * lag_f[k];
-    sy += g_doa_M[1][k] * lag_f[k];
-  }
-  float az = atan2f(sy, sx) * (180.0f / PI_F);
-  if (az < 0.0f) { az += 360.0f; }
-  float smag = sqrtf(sx * sx + sy * sy);
-  if (smag > 1.0f) { smag = 1.0f; }               /* noise can push |u| past 1 */
-  *az_deg = az;
-  *el_deg = acosf(smag) * (180.0f / PI_F);        /* 0 = in-plane, 90 = overhead */
-}
-
-/**
-  * @brief  TASK-11 - geometry/solver self-test, independent of the mics. Synthesize
-  *         the lags an in-plane source at DOA_SELFTEST_AZ would produce, then check
-  *         the solver recovers that azimuth (and elevation ~0). Proves the linear
-  *         algebra + mic_pos wiring before trusting live, noisy lags.
+  * @brief  TASK-11 - self-test independent of the mics. Take the table row for
+  *         DOA_SELFTEST_AZ as synthetic "measured" lags and confirm DOA_Compute
+  *         recovers that azimuth with ~zero residual. Proves the table + matcher.
   */
 void DOA_SelfTest(void)
 {
-  float azr = DOA_SELFTEST_AZ * (PI_F / 180.0f);
-  float ux = cosf(azr), uy = sinf(azr);
-  float lag[DOA_NPAIRS];
-  for (uint32_t k = 0U; k < DOA_NPAIRS; k++)
-  {
-    float dx = mic_pos[k + 1U][0] - mic_pos[0][0];
-    float dy = mic_pos[k + 1U][1] - mic_pos[0][1];
-    lag[k] = -((float)AUDIO_FS_HZ / C_SOUND_MPS) * (dx * ux + dy * uy);
-  }
-  float az, el;
-  DOA_Compute(lag, &az, &el);
+  uint32_t idx = (uint32_t)lroundf(DOA_SELFTEST_AZ / DOA_AZ_STEP) % DOA_N_AZ;
+  float az, resid;
+  DOA_Compute(g_doa_table[idx], &az, &resid);
   int32_t azi = (int32_t)lroundf(az);
-  int32_t eli = (int32_t)lroundf(el);
 
   printf("\r\n--- TASK-11 DOA ---\r\n");
-  printf("self-test: az %d -> az %ld el %ld (expected az %d el 0)\r\n",
-         (int)DOA_SELFTEST_AZ, (long)azi, (long)eli, (int)DOA_SELFTEST_AZ);
+  printf("self-test: az %d -> az %ld resid x1000 = %ld (expected az %d)\r\n",
+         (int)DOA_SELFTEST_AZ, (long)azi,
+         (long)lroundf(resid * 1000.0f), (int)DOA_SELFTEST_AZ);
   int32_t derr = azi - (int32_t)DOA_SELFTEST_AZ;
   if (derr < 0) { derr = -derr; }
-  if ((derr <= 2) && (eli <= 2))
+  if ((derr <= 2) && (resid < 0.01f))
   {
-    printf("TASK-11 self-test OK (azimuth within +/-2 deg).\r\n");
+    printf("TASK-11 self-test OK (azimuth exact, residual ~0).\r\n");
   }
   else
   {
@@ -1350,8 +1629,7 @@ void Pipeline_InitOnce(void)
 #if GCC_ENABLE
   GCC_SelfTest();      /* TASK-08: synthetic 5-sample delay -> lag 5 */
 #if DOA_ENABLE
-  DOA_Init();          /* TASK-11: precompute the least-squares pseudo-inverse */
-  DOA_SelfTest();      /* TASK-11: synthetic azimuth -> recovered azimuth */
+  DOA_SelfTest();      /* TASK-11: hardcoded-table azimuth recovery check */
 #endif
 #endif
 #endif
@@ -1415,10 +1693,44 @@ void StartTask02(void *argument)
     FFT_ProcessAll();
 #if GCC_ENABLE
     GCC_ProcessPairs();
-    /* Hand the TDOA result to DOA_Task (drop if the queue is full). */
+    /* Hand the 4 opposite-pair TDOAs to DOA_Task (drop if the queue is full). */
     tdoa_result_t res;
     res.seq = g_blocks;
     for (uint32_t k = 0U; k < GCC_NPAIRS_LIVE; k++) { res.lag[k] = g_tdoa_lag_f[k]; }
+    /* Frame level for the clap onset gate: ch0 highpassed at 500 Hz, then
+     * sum of squares. The highpass rejects low-frequency room noise (which
+     * dominates the noise floor) so claps - broadband, energy mostly 500-2k Hz
+     * - stand out. Coefficients: 2nd-order Butterworth, Fs=16kHz (from MATLAB
+     * design_clap_hpf.m). Biquad state persists across frames (contiguous DMA). */
+    {
+      static const float HPF_B[3] = {  0.87033078f, -1.74066156f, 0.87033078f };
+      static const float HPF_A[3] = {  1.00000000f, -1.72377617f, 0.75754694f };
+      static float w1 = 0.0f, w2 = 0.0f;     /* transposed direct form II state */
+      float level = 0.0f;
+      for (uint32_t n = 0U; n < AUDIO_BLOCK_SAMPLES; n++)
+      {
+        float in = mic_data[0][n];
+        float yo = HPF_B[0] * in + w1;
+        w1 = HPF_B[1] * in - HPF_A[1] * yo + w2;
+        w2 = HPF_B[2] * in - HPF_A[2] * yo;
+        level += yo * yo;
+      }
+      res.level = level;
+    }
+    /* Clipping detector: if any mic saturated this frame, the waveform is distorted
+     * and its phase (hence DOA) is unreliable - flag it so DOA_Task drops the frame.
+     * mic_raw holds 16-bit-justified samples, full-scale ~32767. */
+    {
+      res.clipped = 0U;
+      for (uint8_t c = 0U; c < NUM_MIC_CHANNELS && !res.clipped; c++)
+      {
+        for (uint32_t n = 0U; n < AUDIO_BLOCK_SAMPLES; n++)
+        {
+          int32_t v = mic_raw[c][n];
+          if (v >= 32000 || v <= -32000) { res.clipped = 1U; break; }
+        }
+      }
+    }
     osMessageQueuePut(result_queueHandle, &res, 0U, 0U);
 #endif
 #endif
@@ -1498,33 +1810,179 @@ void StartTask03(void *argument)
 void StartTask04(void *argument)
 {
   /* USER CODE BEGIN StartTask04 */
-  /* TASK-11: drain the TDOA result queue, solve direction of arrival, and report
-   * azimuth/elevation (degrees) ~once per second. The LED toggles on each printed
-   * fix so a moving source is visible on the board too. */
+  /* TASK-11: drain the TDOA result queue and, once per second, report the
+   * direction of the loudest CLAP so the camera can be steered to it.
+   *
+   * Clap input gate: in a noisy room, steady background noise is everywhere and
+   * would smear the DOA. A clap is an impulsive onset - its frame level jumps
+   * well above the slowly-tracked noise floor. Only such clap frames are voted
+   * on; steady noise keeps updating the floor instead. For each clap frame the
+   * 4 opposite-pair lags are matched to a discrete direction (DOA_Compute) and
+   * that direction gets a vote weighted by match quality (1 - residual). At the
+   * end of each 1-second window the most-voted direction is the cam target. */
   tdoa_result_t res;
-  uint32_t last_print = 0U;
+  uint32_t win_start = 0U;
+
+#define DOA_WIN_BLOCKS 16U             /* ~1 s at 16 blocks/s (lock angle once/sec) */
+#define CLAP_BG_ALPHA  0.10f           /* noise-floor EMA rate (non-clap frames) */
+#define SERVO_SETTLE_MS 100U           /* blank window after a move (servo noise) */
+#define VOTE_DECAY      0.40f          /* voice-mode: carry-over of votes per window */
+  /* Frames captured while the servo is moving (and for a short settle afterwards)
+   * carry the servo's own mechanical noise. Processing them re-triggers the clap
+   * gate and the camera spins forever in a quiet room. We blank detection until
+   * this tick and flush the queue right after each move. */
+  uint32_t servo_quiet_until = 0U;
+  /* Clap thresholds are RUNTIME globals (g_clap_ratio/g_clap_abs/g_doa_resid_max),
+   * settable from the PC over USB CDC - see the SET command parser. */
+  float    vote[DOA_N_AZ] = {0.0f};
+  uint32_t n_acc = 0U;                 /* clap frames accepted this window       */
+  float    bg = g_clap_abs;            /* tracked background noise floor (level) */
+  /* Per-window diagnostics (printed on the "no clap" line to debug the gate). */
+  float    win_peak_ratio = 0.0f;      /* max level/bg seen this window          */
+  float    win_max_lev    = 0.0f;      /* max raw level this window              */
+  float    win_min_resid  = 1.0f;      /* best (lowest) residual this window     */
+  float    win_best_az    = 0.0f;      /* az of the best-fit frame this window   */
+  float    win_best_lev   = 0.0f;      /* level of that best-fit frame           */
+  uint8_t  win_best_clip  = 0U;        /* was that best-fit frame clipped?       */
+
   for (;;)
   {
     if (osMessageQueueGet(result_queueHandle, &res, NULL, portMAX_DELAY) != osOK) { continue; }
 
-#if DOA_ENABLE
-    float az, el;
-    DOA_Compute(res.lag, &az, &el);
-    g_doa_az = az;
-    g_doa_el = el;
-
-    if ((res.seq - last_print) >= 16U)     /* ~1 Hz at 16 blocks/s */
+    /* Servo-noise blanking: while the servo is moving and for SERVO_SETTLE_MS after,
+     * KEEP THE QUEUE EMPTY so not a single servo-noise frame survives into the next
+     * decision. (Just skipping the current frame was not enough: the queue kept
+     * filling with noisy frames during the settle and they got processed afterwards.)
+     * Once the quiet window ends, the next frame fetched is the first clean one. */
+    if (HAL_GetTick() < servo_quiet_until)
     {
-      last_print = res.seq;
-      /* %f is not linked in (newlib-nano, no -u _printf_float); print tenths of a
-       * degree using integer math instead. az in [0,360), el in [0,90]. */
-      int32_t az10 = (int32_t)lroundf(az * 10.0f);
-      int32_t el10 = (int32_t)lroundf(el * 10.0f);
-      printf("DOA seq=%lu az=%ld.%ld el=%ld.%ld\r\n",
-             (unsigned long)res.seq,
-             (long)(az10 / 10), (long)(az10 % 10),
-             (long)(el10 / 10), (long)(el10 % 10));
-      BSP_LED_Toggle(LED_GREEN);
+      osMessageQueueReset(result_queueHandle);   /* drop everything captured while noisy */
+      continue;
+    }
+
+    /* Echo any clap-gate config just changed from the PC (over USB CDC). printf
+     * here (task context) is safe; the CDC parser only sets the dirty flag. Values
+     * are scaled x1000 because the nano printf has no %f. */
+    if (g_cfg_dirty)
+    {
+      g_cfg_dirty = 0U;
+      printf("CFG ratio=%ld abs=%ld resid=%ld (x1000)\r\n",
+             (long)lroundf(g_clap_ratio * 1000.0f),
+             (long)lroundf(g_clap_abs * 1000.0f),
+             (long)lroundf(g_doa_resid_max * 1000.0f));
+    }
+
+#if DOA_ENABLE
+    float az, resid;
+    DOA_Compute(res.lag, &az, &resid);     /* discrete az + normalised residual */
+
+    /* Input gate. Two modes (runtime g_voice_mode):
+     *  - clap (0): level must spike above the tracked noise floor AND an absolute
+     *    minimum - only impulsive onsets (hand claps) pass.
+     *  - voice (1): any frame whose band-limited energy clears the absolute floor
+     *    counts, so continuous speech is voted on and the camera follows a talker. */
+    uint8_t accept;
+    if (g_voice_mode)
+    {
+      accept = (res.level > g_clap_abs);               /* simple voice-activity gate */
+    }
+    else
+    {
+      accept = (res.level > g_clap_ratio * bg) && (res.level > g_clap_abs);
+    }
+    if (!accept)
+    {
+      bg += CLAP_BG_ALPHA * (res.level - bg);   /* EMA track background (silence) */
+    }
+
+    /* Track this window's loudest frame and best fit for the debug print. */
+    {
+      float ratio = (bg > 1e-20f) ? (res.level / bg) : 0.0f;
+      if (ratio > win_peak_ratio)     { win_peak_ratio = ratio; }
+      if (res.level > win_max_lev)    { win_max_lev = res.level; }
+      if (resid < win_min_resid)      { win_min_resid = resid; win_best_az = az;
+                                        win_best_lev = res.level; win_best_clip = res.clipped; }
+    }
+
+    /* Vote every frame that clears the gate and fits the table. Clipped frames are
+     * NOT dropped: when speaking loudly almost every frame clips, so dropping them
+     * starved the vote and the camera never moved. Their DOA is noisier but on
+     * average still points at the talker; the 1-second window + decay average it. */
+    if (accept && (resid < g_doa_resid_max))
+    {
+      uint32_t idx = (uint32_t)lroundf(az / DOA_AZ_STEP) % DOA_N_AZ;
+      vote[idx] += (1.0f - resid);         /* weight cleaner matches more       */
+      n_acc++;
+    }
+
+    if ((res.seq - win_start) >= DOA_WIN_BLOCKS)   /* 1-second window elapsed    */
+    {
+      win_start = res.seq;
+      /* Voice gives only ~1 well-fitting frame per second (syllables, pauses), so
+       * one accepted frame is enough to steer; the decay accumulator + 25% plurality
+       * + servo dead-band keep it from chasing a single stray frame. */
+      uint32_t need_acc = 4U;
+      if (n_acc >= need_acc)
+      {
+        /* dominant direction = most-voted (plurality) over the decayed window */
+        uint32_t best = 0U;
+        float    best_v = -1.0f, total_v = 0.0f;
+        for (uint32_t a = 0U; a < DOA_N_AZ; a++)
+        {
+          total_v += vote[a];
+          if (vote[a] > best_v) { best_v = vote[a]; best = a; }
+        }
+        /* Voice DOA is naturally spread, so the plurality winner only gets ~25-30%.
+         * Require a light plurality (>=25%) rather than a strict majority, else the
+         * camera would never move. Temporal decay + the servo dead-band keep it from
+         * jittering between near-equal directions. */
+        uint8_t steer = (total_v > 0.0f) && (best_v >= 0.25f * total_v);
+        g_doa_az = g_doa_angles[best];
+        g_doa_el = 0.0f;
+        if (g_servo_auto && (!g_voice_mode || steer))
+        {
+          Servo_PointToAzimuth(g_doa_az);                 /* aim camera (blocks while moving) */
+          osMessageQueueReset(result_queueHandle);        /* drop frames captured while moving */
+          servo_quiet_until = HAL_GetTick() + SERVO_SETTLE_MS;  /* blank the settle period   */
+        }
+        int32_t azi = (int32_t)lroundf(g_doa_az);
+        printf("DOA seq=%lu az=%ld (cam target, servo=%ld, %lu clap frames)\r\n",
+               (unsigned long)res.seq, (long)azi,
+               (long)lroundf(g_servo_deg), (unsigned long)n_acc);
+        BSP_LED_Toggle(LED_GREEN);
+      }
+      else
+      {
+        /* No clap this second, but still report the live RELATIVE direction of the
+         * best-fit frame so the host always has an angle. "live" flags that it was
+         * NOT a confirmed clap. peakRatio/level kept for gate tuning (x1e3 / x1e6). */
+        int32_t azl = (int32_t)lroundf(win_best_az);
+        /* bestLev_u / bestClip = level & clip flag of the SAME frame that gave the
+         * best fit (win_min_resid), so we can see if the best-fitting frame clears
+         * the abs gate. absNeed_u = g_clap_abs in the same x1e6 units. */
+        printf("DOA seq=%lu az=%ld live resid=%ld peakRatio=%ld maxLev_u=%ld bestLev_u=%ld bestClip=%u absNeed_u=%ld\r\n",
+               (unsigned long)res.seq, (long)azl,
+               (long)lroundf(win_min_resid  * 1000.0f),
+               (long)lroundf(win_peak_ratio * 1000.0f),
+               (long)lroundf(win_max_lev * 1000000.0f),
+               (long)lroundf(win_best_lev * 1000000.0f),
+               (unsigned)win_best_clip,
+               (long)lroundf(g_clap_abs * 1000000.0f));
+      }
+      win_peak_ratio = 0.0f; win_max_lev = 0.0f; win_min_resid = 1.0f; win_best_az = 0.0f;
+      win_best_lev = 0.0f; win_best_clip = 0U;
+      /* Voice mode: decay votes instead of clearing them, so a steady talker keeps
+       * accumulating in one direction (temporal smoothing) while stray frames fade.
+       * Clap mode: hard-reset each window for crisp per-clap response. */
+      if (g_voice_mode)
+      {
+        for (uint32_t a = 0U; a < DOA_N_AZ; a++) { vote[a] *= VOTE_DECAY; }
+      }
+      else
+      {
+        for (uint32_t a = 0U; a < DOA_N_AZ; a++) { vote[a] = 0.0f; }
+      }
+      n_acc = 0U;
     }
 #else
     if ((res.seq - last_print) >= 16U)

@@ -1,0 +1,82 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="plot_doa.py" id="plot-doa-simple">
+    <mxGraphModel dx="1703" dy="940" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1150" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="t_start" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=50;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1" value="BẮT ĐẦU&#xa;(mở cổng VCP, đọc DOA từ board)" vertex="1">
+          <mxGeometry height="60" width="260" x="300" y="40" as="geometry" />
+        </mxCell>
+        <mxCell id="io_read" parent="1" style="shape=parallelogram;perimeter=parallelogramPerimeter;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" value="Đọc 1 dòng dữ liệu từ board" vertex="1">
+          <mxGeometry height="50" width="260" x="300" y="150" as="geometry" />
+        </mxCell>
+        <mxCell id="d_az" parent="1" style="rhombus;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" value="Có góc hướng âm (az) ?" vertex="1">
+          <mxGeometry height="110" width="240" x="310" y="250" as="geometry" />
+        </mxCell>
+        <mxCell id="p_wait" parent="1" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" value="Hiển thị &quot;đang chờ dữ liệu&quot;" vertex="1">
+          <mxGeometry height="60" width="170" x="640" y="275" as="geometry" />
+        </mxCell>
+        <mxCell id="p_arrow" parent="1" style="shape=process;whiteSpace=wrap;html=1;backgroundOutline=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" value="Vẽ mũi tên chỉ về hướng nguồn âm,&#xa;tính góc servo tương ứng" vertex="1">
+          <mxGeometry height="60" width="260" x="300" y="420" as="geometry" />
+        </mxCell>
+        <mxCell id="p_hist" parent="1" style="shape=process;whiteSpace=wrap;html=1;backgroundOutline=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" value="Vẽ các nguồn âm đã phát hiện&#xa;(chấm to dần theo số lần)" vertex="1">
+          <mxGeometry height="60" width="260" x="300" y="520" as="geometry" />
+        </mxCell>
+        <mxCell id="p_draw" parent="1" style="shape=process;whiteSpace=wrap;html=1;backgroundOutline=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" value="Cập nhật màn hình đồ thị" vertex="1">
+          <mxGeometry height="50" width="260" x="300" y="620" as="geometry" />
+        </mxCell>
+        <mxCell id="2" edge="1" parent="1" source="d_close" style="edgeStyle=none;html=1;" target="t_end" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="d_close" parent="1" style="rhombus;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" value="Đã tắt chương trình ?" vertex="1">
+          <mxGeometry height="100" width="240" x="310" y="720" as="geometry" />
+        </mxCell>
+        <mxCell id="t_end" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=50;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1" value="KẾT THÚC" vertex="1">
+          <mxGeometry height="50" width="180" x="340" y="880" as="geometry" />
+        </mxCell>
+        <mxCell id="e1" edge="1" parent="1" source="t_start" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" target="io_read">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e2" edge="1" parent="1" source="io_read" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" target="d_az">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e3" edge="1" parent="1" source="d_az" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;" target="p_wait" value="sai">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e4" edge="1" parent="1" source="d_az" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" target="p_arrow" value="đúng">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e5" edge="1" parent="1" source="p_wait" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="725" y="600" />
+            </Array>
+            <mxPoint x="430" y="600" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e6" edge="1" parent="1" source="p_arrow" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" target="p_hist">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e7" edge="1" parent="1" source="p_hist" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" target="p_draw">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e8" edge="1" parent="1" source="p_draw" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" target="d_close">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e9" edge="1" parent="1" source="d_close" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" target="io_read" value="sai">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="250" y="770" />
+              <mxPoint x="250" y="175" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e10" edge="1" parent="1" source="d_close" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" target="t_end" value="đúng">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

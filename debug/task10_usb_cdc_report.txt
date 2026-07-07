@@ -1,17 +1,17 @@
 TASK-10 USB CDC transmit continuity check
-Generated: 2026-06-01 23:44:50
+Generated: 2026-06-10 19:22:18
 
 TASK-10 USB CDC Transmit Continuity Check
-Auto-detected OTG CDC port: COM12
-Streaming 60 s, need >= 300 gap-free frame(s) (frame = 32780 bytes).
+Using OTG CDC port: COM12
+Streaming 10 s, need >= 50 gap-free frame(s) (frame = 32780 bytes).
 
-Captured 31105853 bytes (~29.7 MB) from COM12 in ~60 s
+Captured 5220149 bytes (~5.0 MB) from COM12 in ~10 s
 
-Frames: 948 valid, seq 1..948, ~15.8 fps, gaps=0, range-checked=10 bad=0
+Frames: 157 valid, seq 4589..4745, ~15.7 fps, gaps=0, range-checked=2 bad=0
 
-[ OK ] Received 948 valid RAW1 frames (~15.8 fps)
-[ OK ] No sequence gaps over 60 s (continuous transport)
-[ OK ] Sampled frames within 24-bit range (10 checked)
+[ OK ] Received 157 valid RAW1 frames (~15.7 fps)
+[ OK ] No sequence gaps over 10 s (continuous transport)
+[ OK ] Sampled frames within 24-bit range (2 checked)
 
 TASK-10 USB CDC continuity check passed.
 Report written to: C:\Users\huybu\OneDrive\Máy tính\code_TN\debug\task10_usb_cdc_report.txt

@@ -1,6 +1,9 @@
 # --- STM32CubeIDE build output ---
 STM32CubeIDE/Debug/
 STM32CubeIDE/Release/
+
+# --- Makefile build output ---
+build/
 *.o
 *.d
 *.su
@@ -10,6 +13,18 @@ STM32CubeIDE/Release/
 *.list
 *.bin
 *.hex
+
+# --- Python tools ---
+tools/__pycache__/
+*.pyc
+
+# --- Recorded audio / diagnostics (artifacts, not source) ---
+debug/*.npy
+debug/*.wav
+debug/*.png
+debug/*.csv
+debug/*_wav/
+debug/saleae_*/
 
 # --- OS / editor ---
 Thumbs.db
