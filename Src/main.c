@@ -253,13 +253,16 @@ volatile float g_doa_err;                        /* normalised min residual    *
  * Defaults are the relaxed/easy-to-trigger values. g_cfg_dirty is raised by the
  * CDC parser so DOA_Task echoes the new config to the VCP log. */
 volatile float   g_clap_ratio    = 1.8f;         /* clap if level > ratio*floor */
-volatile float   g_clap_abs      = 0.000003f;    /* absolute level floor (sum over a
+volatile float   g_clap_abs      = 0.0001f;      /* absolute level floor (sum over a
                                                   * frame of normalised ch0 energy).
-                                                  * Soft speech ~3e-5..1e-4; silence
-                                                  * ~7e-6. 5e-6 lets speech through and
-                                                  * the residual gate rejects noise.
-                                                  * (Was 0.0005 = ~10x too high, so
-                                                  * normal speech never passed.) */
+                                                  * Retuned for the uniform 24-bit mic
+                                                  * front-end: live "alo" peaks at
+                                                  * maxLev_u ~2k-28k (level ~2e-3..3e-2),
+                                                  * silence ~250 (~2.5e-4). 1e-4 catches
+                                                  * speech and the residual gate rejects
+                                                  * incoherent noise. Was 3e-6 (tuned for
+                                                  * the old 16-bit path, ~65000x smaller
+                                                  * level) - far too low here. */
 volatile float   g_doa_resid_max = 0.7f;         /* reject fits worse than this */
 volatile uint8_t g_cfg_dirty     = 0U;           /* CDC parser -> DOA_Task echo */
 /* Voice-tracking mode: 0 = clap gate (impulsive onset only); 1 = continuous voice

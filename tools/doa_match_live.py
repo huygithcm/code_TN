@@ -56,7 +56,7 @@ def gcc_lag(a,b):
     n=1
     while n<2*len(a): n*=2
     A=np.fft.rfft(a-a.mean(),n); B=np.fft.rfft(b-b.mean(),n)
-    R=A*np.conj(B); f=np.fft.rfftfreq(n,1/FS)
+    R=np.conj(A)*B; f=np.fft.rfftfreq(n,1/FS)   # conj(Xa).Xb - khop dau firmware
     band=(f>=BAND[0])&(f<=BAND[1])
     Rw=np.where(band, R/(np.abs(R)+1e-9), 0.0)
     cc=np.fft.irfft(Rw,n); m=6
